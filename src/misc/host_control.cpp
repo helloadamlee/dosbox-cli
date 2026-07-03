@@ -13,6 +13,7 @@
 #endif
 
 #include "control.h"
+#include "dos_inc.h"
 #include "shell.h"
 
 namespace host_control {
@@ -32,6 +33,23 @@ uint64_t get_monotonic_ms()
 	using namespace std::chrono;
 	return static_cast<uint64_t>(
 	        duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
+std::string get_current_dos_path()
+{
+	const auto drive = static_cast<char>('A' + DOS_GetDefaultDrive());
+	char dir[DOS_PATHLENGTH] = {};
+	if (!DOS_GetCurrentDir(0, dir, true) || dir[0] == 0) {
+		return std::string(1, drive) + ":\\";
+	}
+	return std::string(1, drive) + ":\\" + dir;
+}
+
+void populate_command_result(CommandResult &result)
+{
+	result.errorlevel = dos.return_code;
+	result.drive.assign(1, static_cast<char>('A' + DOS_GetDefaultDrive()));
+	result.cwd = get_current_dos_path();
 }
 
 bool emit_session_line(const std::string &line)
@@ -203,7 +221,10 @@ SessionResult run_control_session(const Options &options,
 		CommandResult command_result = {};
 		active_request_id = request.id;
 		reset_buffered_output(buffered_output, request.id);
+		const auto start_ms = get_monotonic_ms();
 		const bool ok = exec_request(request, command_result);
+		const auto end_ms = get_monotonic_ms();
+		command_result.duration_ms = end_ms >= start_ms ? (end_ms - start_ms) : 0;
 		if (session_write_failed ||
 		    !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
 			result.had_io_error = true;
@@ -240,7 +261,11 @@ bool run_stdio_shell()
 	        read_stdin_line,
 	        write_stdout_line,
 	        [](const Request &request, CommandResult &result) {
-		        return SHELL_ExecuteHostCommand(request.command, result.shell_exit);
+		        const bool ok = SHELL_ExecuteHostCommand(request.command, result.shell_exit);
+		        if (ok) {
+			        populate_command_result(result);
+		        }
+		        return ok;
 	        });
 	return result.started;
 }
@@ -346,7 +371,11 @@ bool run_socket_shell()
 	        [client_fd](std::string &line) { return read_fd_line(client_fd, line); },
 	        [client_fd](const std::string &line) { return write_fd_line(client_fd, line); },
 	        [](const Request &request, CommandResult &result) {
-		        return SHELL_ExecuteHostCommand(request.command, result.shell_exit);
+		        const bool ok = SHELL_ExecuteHostCommand(request.command, result.shell_exit);
+		        if (ok) {
+			        populate_command_result(result);
+		        }
+		        return ok;
 	        });
 
 	close_fd(client_fd);

@@ -3,7 +3,9 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdio>
+#include <thread>
 #include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -306,7 +308,6 @@ TEST(HostControlProtocolTest, SessionRunnerFlushesBufferedOutputBeforeStructured
 		result.errorlevel = 7;
 		result.drive = "Z";
 		result.cwd = "Z:\\BUILD";
-		result.duration_ms = 12;
 		host_control::capture_dos_write(
 		        DeviceInfoFlags::Device | DeviceInfoFlags::StdOut,
 		        "CON",
@@ -328,8 +329,58 @@ TEST(HostControlProtocolTest, SessionRunnerFlushesBufferedOutputBeforeStructured
 	          "{\"event\":\"ready\",\"transport\":\"socket\",\"endpoint\":\"/tmp/d.sock\"}\n");
 	EXPECT_EQ(writes[1],
 	          "{\"event\":\"output\",\"id\":\"9\",\"encoding\":\"base64\",\"data\":\"aGkNCg==\"}\n");
-	EXPECT_EQ(writes[2],
-	          "{\"event\":\"result\",\"id\":\"9\",\"ok\":true,\"shell_exit\":false,\"errorlevel\":7,\"drive\":\"Z\",\"cwd\":\"Z:\\\\BUILD\",\"duration_ms\":12}\n");
+	EXPECT_NE(writes[2].find("\"event\":\"result\""), std::string::npos);
+	EXPECT_NE(writes[2].find("\"id\":\"9\""), std::string::npos);
+	EXPECT_NE(writes[2].find("\"ok\":true"), std::string::npos);
+	EXPECT_NE(writes[2].find("\"shell_exit\":false"), std::string::npos);
+	EXPECT_NE(writes[2].find("\"errorlevel\":7"), std::string::npos);
+	EXPECT_NE(writes[2].find("\"drive\":\"Z\""), std::string::npos);
+	EXPECT_NE(writes[2].find("\"cwd\":\"Z:\\\\BUILD\""), std::string::npos);
+	EXPECT_NE(writes[2].find("\"duration_ms\":"), std::string::npos);
+}
+
+TEST(HostControlProtocolTest, SessionRunnerEmitsStructuredResultMetadata)
+{
+	std::vector<std::string> writes = {};
+	std::vector<std::string> requests = {R"({"id":"11","op":"exec","command":"cd \\build"})"};
+	std::size_t next_request = 0;
+
+	const auto read_line = [&](std::string &line) {
+		if (next_request >= requests.size()) {
+			line.clear();
+			return false;
+		}
+
+		line = requests[next_request++];
+		return true;
+	};
+	const auto write_line = [&](const std::string &line) {
+		writes.push_back(line);
+		return true;
+	};
+	const auto exec_request = [&](const host_control::Request &,
+	                              host_control::CommandResult &result) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+		result.shell_exit = false;
+		result.errorlevel = 1;
+		result.drive = "Z";
+		result.cwd = "Z:\\BUILD";
+		return true;
+	};
+
+	const auto session = host_control::run_control_session(
+	        host_control::Options{host_control::Transport::Stdio, ""},
+	        read_line,
+	        write_line,
+	        exec_request);
+
+	EXPECT_TRUE(session.started);
+	EXPECT_FALSE(session.had_io_error);
+	ASSERT_EQ(writes.size(), 2u);
+	EXPECT_NE(writes[1].find("\"errorlevel\":1"), std::string::npos);
+	EXPECT_NE(writes[1].find("\"drive\":\"Z\""), std::string::npos);
+	EXPECT_NE(writes[1].find("\"cwd\":\"Z:\\\\BUILD\""), std::string::npos);
+	EXPECT_EQ(writes[1].find("\"duration_ms\":0"), std::string::npos);
 }
 
 #if defined(__unix__) || defined(__APPLE__)
