@@ -126,10 +126,37 @@ TEST(HostControlProtocolTest, OutputLineEscapesPayload)
 
 TEST(HostControlProtocolTest, ExecResultLineReportsShellState)
 {
-	EXPECT_EQ(host_control::make_exec_result_json_line("42", true, false),
-	          "{\"event\":\"result\",\"id\":\"42\",\"ok\":true,\"shell_exit\":false}\n");
-	EXPECT_EQ(host_control::make_exec_result_json_line("43", false, true),
-	          "{\"event\":\"result\",\"id\":\"43\",\"ok\":false,\"shell_exit\":true}\n");
+	host_control::CommandResult result = {};
+	result.shell_exit = false;
+	result.errorlevel = 0;
+	result.drive = "C";
+	result.cwd = "C:\\XCODE101L";
+	result.duration_ms = 183;
+
+	EXPECT_EQ(host_control::make_exec_result_json_line("42", true, result),
+	          "{\"event\":\"result\",\"id\":\"42\",\"ok\":true,\"shell_exit\":false,\"errorlevel\":0,\"drive\":\"C\",\"cwd\":\"C:\\\\XCODE101L\",\"duration_ms\":183}\n");
+
+	result.shell_exit = true;
+	result.errorlevel = 7;
+	result.drive = "Z";
+	result.cwd = "Z:\\";
+	result.duration_ms = 0;
+
+	EXPECT_EQ(host_control::make_exec_result_json_line("43", false, result),
+	          "{\"event\":\"result\",\"id\":\"43\",\"ok\":false,\"shell_exit\":true,\"errorlevel\":7,\"drive\":\"Z\",\"cwd\":\"Z:\\\\\",\"duration_ms\":0}\n");
+}
+
+TEST(HostControlProtocolTest, ExecResultEscapesStructuredPathFields)
+{
+	host_control::CommandResult result = {};
+	result.shell_exit = false;
+	result.errorlevel = 3;
+	result.drive = "C";
+	result.cwd = "C:\\TMP\\\"QUOTED\"";
+	result.duration_ms = 44;
+
+	EXPECT_EQ(host_control::make_exec_result_json_line("77", true, result),
+	          "{\"event\":\"result\",\"id\":\"77\",\"ok\":true,\"shell_exit\":false,\"errorlevel\":3,\"drive\":\"C\",\"cwd\":\"C:\\\\TMP\\\\\\\"QUOTED\\\"\",\"duration_ms\":44}\n");
 }
 
 TEST(HostControlProtocolTest, OutputBytesUseBase64Encoding)
@@ -229,8 +256,9 @@ TEST(HostControlProtocolTest, SessionRunnerEmitsReadyAndInvalidRequestError)
 		writes.push_back(line);
 		return true;
 	};
-	const auto exec_request = [&](const host_control::Request &, bool &shell_exit) {
-		shell_exit = false;
+	const auto exec_request = [&](const host_control::Request &,
+	                              host_control::CommandResult &result) {
+		result.shell_exit = false;
 		return false;
 	};
 
@@ -250,7 +278,7 @@ TEST(HostControlProtocolTest, SessionRunnerEmitsReadyAndInvalidRequestError)
 	EXPECT_EQ(writes[1], "{\"event\":\"error\",\"id\":\"42\",\"message\":\"unsupported op\"}\n");
 }
 
-TEST(HostControlProtocolTest, SessionRunnerFlushesBufferedOutputBeforeResult)
+TEST(HostControlProtocolTest, SessionRunnerFlushesBufferedOutputBeforeStructuredResult)
 {
 	std::vector<std::string> writes = {};
 	std::vector<std::string> requests = {R"({"id":"9","op":"exec","command":"echo hi"})"};
@@ -269,11 +297,16 @@ TEST(HostControlProtocolTest, SessionRunnerFlushesBufferedOutputBeforeResult)
 		writes.push_back(line);
 		return true;
 	};
-	const auto exec_request = [&](const host_control::Request &request, bool &shell_exit) {
+	const auto exec_request = [&](const host_control::Request &request,
+	                              host_control::CommandResult &result) {
 		const uint8_t bytes[] = {'h', 'i', '\r', '\n'};
-		shell_exit = false;
 		EXPECT_EQ(request.id, "9");
 		EXPECT_EQ(request.command, "echo hi");
+		result.shell_exit = false;
+		result.errorlevel = 7;
+		result.drive = "Z";
+		result.cwd = "Z:\\BUILD";
+		result.duration_ms = 12;
 		host_control::capture_dos_write(
 		        DeviceInfoFlags::Device | DeviceInfoFlags::StdOut,
 		        "CON",
@@ -296,7 +329,7 @@ TEST(HostControlProtocolTest, SessionRunnerFlushesBufferedOutputBeforeResult)
 	EXPECT_EQ(writes[1],
 	          "{\"event\":\"output\",\"id\":\"9\",\"encoding\":\"base64\",\"data\":\"aGkNCg==\"}\n");
 	EXPECT_EQ(writes[2],
-	          "{\"event\":\"result\",\"id\":\"9\",\"ok\":true,\"shell_exit\":false}\n");
+	          "{\"event\":\"result\",\"id\":\"9\",\"ok\":true,\"shell_exit\":false,\"errorlevel\":7,\"drive\":\"Z\",\"cwd\":\"Z:\\\\BUILD\",\"duration_ms\":12}\n");
 }
 
 #if defined(__unix__) || defined(__APPLE__)

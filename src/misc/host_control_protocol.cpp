@@ -234,14 +234,24 @@ std::string make_output_bytes_json_line(const std::string &id, const uint8_t *da
 	return json;
 }
 
-std::string make_exec_result_json_line(const std::string &id, const bool ok, const bool shell_exit)
+std::string make_exec_result_json_line(const std::string &id,
+                                       const bool ok,
+                                       const CommandResult &result)
 {
 	std::string json = "{\"event\":\"result\",\"id\":\"";
 	json += json_escape(id);
 	json += "\",\"ok\":";
 	json += ok ? "true" : "false";
 	json += ",\"shell_exit\":";
-	json += shell_exit ? "true" : "false";
+	json += result.shell_exit ? "true" : "false";
+	json += ",\"errorlevel\":";
+	json += std::to_string(result.errorlevel);
+	json += ",\"drive\":\"";
+	json += json_escape(result.drive);
+	json += "\",\"cwd\":\"";
+	json += json_escape(result.cwd);
+	json += "\",\"duration_ms\":";
+	json += std::to_string(result.duration_ms);
 	json += "}\n";
 	return json;
 }

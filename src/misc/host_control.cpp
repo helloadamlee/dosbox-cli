@@ -200,10 +200,10 @@ SessionResult run_control_session(const Options &options,
 			continue;
 		}
 
-		bool shell_exit = false;
+		CommandResult command_result = {};
 		active_request_id = request.id;
 		reset_buffered_output(buffered_output, request.id);
-		const bool ok = exec_request(request, shell_exit);
+		const bool ok = exec_request(request, command_result);
 		if (session_write_failed ||
 		    !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
 			result.had_io_error = true;
@@ -212,11 +212,11 @@ SessionResult run_control_session(const Options &options,
 		}
 		active_request_id.clear();
 
-		if (!emit_session_line(make_exec_result_json_line(request.id, ok, shell_exit))) {
+		if (!emit_session_line(make_exec_result_json_line(request.id, ok, command_result))) {
 			result.had_io_error = true;
 			break;
 		}
-		if (shell_exit) {
+		if (command_result.shell_exit) {
 			break;
 		}
 	}
@@ -239,8 +239,8 @@ bool run_stdio_shell()
 	        control->opt_host_control,
 	        read_stdin_line,
 	        write_stdout_line,
-	        [](const Request &request, bool &shell_exit) {
-		        return SHELL_ExecuteHostCommand(request.command, shell_exit);
+	        [](const Request &request, CommandResult &result) {
+		        return SHELL_ExecuteHostCommand(request.command, result.shell_exit);
 	        });
 	return result.started;
 }
@@ -345,8 +345,8 @@ bool run_socket_shell()
 	        control->opt_host_control,
 	        [client_fd](std::string &line) { return read_fd_line(client_fd, line); },
 	        [client_fd](const std::string &line) { return write_fd_line(client_fd, line); },
-	        [](const Request &request, bool &shell_exit) {
-		        return SHELL_ExecuteHostCommand(request.command, shell_exit);
+	        [](const Request &request, CommandResult &result) {
+		        return SHELL_ExecuteHostCommand(request.command, result.shell_exit);
 	        });
 
 	close_fd(client_fd);

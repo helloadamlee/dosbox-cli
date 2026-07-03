@@ -34,6 +34,14 @@ struct BufferedOutput {
 	uint64_t first_byte_ms = 0;
 };
 
+struct CommandResult {
+	bool shell_exit = false;
+	uint32_t errorlevel = 0;
+	std::string drive = {};
+	std::string cwd = {};
+	uint64_t duration_ms = 0;
+};
+
 struct SessionResult {
 	bool started = false;
 	bool had_io_error = false;
@@ -47,7 +55,7 @@ struct SocketServer {
 
 using ReadLineFn = std::function<bool(std::string &)>;
 using WriteLineFn = std::function<bool(const std::string &)>;
-using ExecRequestFn = std::function<bool(const Request &, bool &)>;
+using ExecRequestFn = std::function<bool(const Request &, CommandResult &)>;
 
 inline const char *transport_to_string(const Transport transport)
 {
@@ -99,7 +107,9 @@ Request parse_request_line(const std::string &line);
 std::string make_error_json_line(const std::string &id, const std::string &message);
 std::string make_output_json_line(const std::string &id, const std::string &text);
 std::string make_output_bytes_json_line(const std::string &id, const uint8_t *data, std::size_t size);
-std::string make_exec_result_json_line(const std::string &id, bool ok, bool shell_exit);
+std::string make_exec_result_json_line(const std::string &id,
+                                       bool ok,
+                                       const CommandResult &result);
 void reset_buffered_output(BufferedOutput &buffer, const std::string &request_id);
 void append_buffered_output(BufferedOutput &buffer, const uint8_t *data, std::size_t size, uint64_t now_ms);
 bool has_buffered_output(const BufferedOutput &buffer);
