@@ -864,6 +864,10 @@ bool DOS_WriteFile(uint16_t entry,const uint8_t * data,uint16_t * amount,bool fc
 	uint16_t towrite=*amount;
 	bool ret=Files[handle]->Write(data,&towrite);
 	*amount=towrite;
+	if (towrite != 0) {
+		host_control::capture_dos_write(
+		        Files[handle]->GetInformation(), Files[handle]->GetName(), data, towrite);
+	}
 	return ret;
 }
 

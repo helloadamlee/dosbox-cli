@@ -42,6 +42,7 @@ class DOS_Shell;
 /* first_shell is used to add and delete stuff from the shell env 
  * by "external" programs. (config) */
 extern DOS_Shell * first_shell;
+bool SHELL_ExecuteHostCommand(const std::string &command, bool &shell_exit);
 
 const std::map<int, std::string> langcp_map {
 	{437, "en_US"},
