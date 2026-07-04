@@ -27,6 +27,7 @@
 
 #include "programs.h"
 #include "setup.h"
+#include "host_control.h"
 
 class Config{
 public:
@@ -113,6 +114,8 @@ public:
     bool opt_nolog = false;
     bool opt_exit = false;
     bool opt_test = false;
+    bool opt_headless = false;
+    host_control::Options opt_host_control = {};
 };
 
 #endif

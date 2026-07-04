@@ -23,6 +23,7 @@
 
 #include "dos_files_tests.cpp"
 #include "drives_tests.cpp"
+#include "host_control_protocol_tests.cpp"
 #include "shell_cmds_tests.cpp"
 #include "shell_redirection_tests.cpp"
 

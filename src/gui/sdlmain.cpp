@@ -7419,6 +7419,10 @@ bool DOSBOX_parse_argv() {
             fprintf(stderr,"  -nomenu                                 Do not show menu\n");
             fprintf(stderr,"  -showcycles                             Show cycles count (FPS) in the title\n");
             fprintf(stderr,"  -showrt                                 Show emulation speed relative to realtime in the title\n");
+            fprintf(stderr,"  -headless                               Start without opening the SDL UI\n");
+            fprintf(stderr,"  -control-stdio                          Enable newline-delimited JSON host control on stdin/stdout\n");
+            fprintf(stderr,"  -control-socket <path>                  Enable host control over a local socket path\n");
+            fprintf(stderr,"  -control-pipe <path>                    Enable host control over a named pipe path\n");
             fprintf(stderr,"  -socket <socketnum>                     Specify the socket number for null-modem emulation\n");
             fprintf(stderr,"  -savedir <path>                         Set path for the save slots\n");
             fprintf(stderr,"  -defaultdir <path>                      Set the default working path for DOSBox-X\n");
@@ -7527,6 +7531,27 @@ bool DOSBOX_parse_argv() {
             control->opt_silent = true;
             control->opt_nomenu = true;
             control->opt_fastlaunch = true;
+        }
+        else if (optname == "headless") {
+            putenv(const_cast<char*>("SDL_AUDIODRIVER=dummy"));
+            putenv(const_cast<char*>("SDL_VIDEODRIVER=dummy"));
+            control->opt_headless = true;
+            control->opt_nomenu = true;
+            control->opt_fastlaunch = true;
+        }
+        else if (optname == "control-stdio") {
+            control->opt_host_control.transport = host_control::Transport::Stdio;
+            control->opt_host_control.endpoint.clear();
+        }
+        else if (optname == "control-socket") {
+            if (!control->cmdline->NextOptArgv(tmp)) return false;
+            control->opt_host_control.transport = host_control::Transport::Socket;
+            control->opt_host_control.endpoint = tmp;
+        }
+        else if (optname == "control-pipe") {
+            if (!control->cmdline->NextOptArgv(tmp)) return false;
+            control->opt_host_control.transport = host_control::Transport::Pipe;
+            control->opt_host_control.endpoint = tmp;
         }
         else if (optname == "test" || optname == "tests" || optname == "gtest_list_tests") {
             putenv(const_cast<char*>("SDL_VIDEODRIVER=dummy"));

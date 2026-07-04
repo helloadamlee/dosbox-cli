@@ -6,6 +6,7 @@ callback.h \
 cpu.h \
 cross.h \
 control.h \
+host_control.h \
 debug.h \
 dma.h \
 dos_inc.h \
@@ -53,5 +54,4 @@ unzip.h \
 zip.h \
 crypt.h \
 mztools.h
-
 

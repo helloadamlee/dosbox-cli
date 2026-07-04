@@ -1309,6 +1309,38 @@ void DOS_Shell::Run(void) {
 	shellrun=false;
 }
 
+bool SHELL_ExecuteHostCommand(const std::string &command, bool &shell_exit)
+{
+	shell_exit = true;
+	if (first_shell == nullptr) {
+		return false;
+	}
+
+	char input_line[CMD_MAXLINE] = {0};
+	input_line[CMD_MAXLINE - 1u] = 0;
+	strncpy(input_line, command.c_str(), CMD_MAXLINE - 1u);
+
+	char *sep = strpbrk(input_line, "\r\n");
+	if (sep != nullptr) {
+		*sep = 0;
+	}
+
+	if (strlen(input_line) != 0) {
+		if (shell_keyboard_flush) {
+			DOS_FlushSTDIN();
+		}
+
+		first_shell->ParseLine(input_line);
+
+		if (shell_keyboard_flush) {
+			DOS_FlushSTDIN();
+		}
+	}
+
+	shell_exit = first_shell->exit;
+	return true;
+}
+
 void DOS_Shell::SyntaxError(void) {
 	WriteOut(MSG_Get("SHELL_SYNTAXERROR"));
 }
@@ -2249,7 +2281,12 @@ void SHELL_Run() {
 		return;
 	}
 	try {
-		first_shell->Run();
+		if (host_control::is_stdio_enabled(control->opt_host_control))
+			host_control::run_stdio_shell();
+		else if (host_control::is_socket_enabled(control->opt_host_control))
+			host_control::run_socket_shell();
+		else
+			first_shell->Run();
 		delete first_shell;
 		first_shell = nullptr;//Make clear that it shouldn't be used anymore
 		prepared = false;
@@ -2713,4 +2750,3 @@ void CONFIGSHELL_Run() {
 	}
 #endif
 }
-
