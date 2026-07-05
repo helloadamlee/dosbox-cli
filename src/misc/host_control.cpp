@@ -52,6 +52,17 @@ void populate_command_result(CommandResult &result)
 	result.cwd = get_current_dos_path();
 }
 
+StatusSnapshot snapshot_status(const Options &options)
+{
+	StatusSnapshot status = {};
+	status.transport = options.transport;
+	status.session_active = session_active;
+	status.errorlevel = dos.return_code;
+	status.drive.assign(1, static_cast<char>('A' + DOS_GetDefaultDrive()));
+	status.cwd = get_current_dos_path();
+	return status;
+}
+
 bool emit_session_line(const std::string &line)
 {
 	if (line.empty()) {
@@ -212,6 +223,14 @@ SessionResult run_control_session(const Options &options,
 		const auto request = parse_request_line(line);
 		if (!request.ok) {
 			if (!emit_session_line(make_error_json_line(request.id, request.error))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
+		if (request.op == "status") {
+			if (!emit_session_line(make_status_json_line(request.id, snapshot_status(options)))) {
 				result.had_io_error = true;
 				break;
 			}

@@ -182,18 +182,21 @@ Request parse_request_line(const std::string &line)
 	}
 
 	request.op = op_it->second;
-	if (request.op != "exec") {
+	if (request.op != "exec" && request.op != "status") {
 		request.error = "unsupported op";
 		return request;
 	}
 
-	const auto command_it = values.find("command");
-	if (command_it == values.end()) {
-		request.error = "missing command";
-		return request;
+	if (request.op == "exec") {
+		const auto command_it = values.find("command");
+		if (command_it == values.end()) {
+			request.error = "missing command";
+			return request;
+		}
+
+		request.command = command_it->second;
 	}
 
-	request.command = command_it->second;
 	request.ok = true;
 	return request;
 }
@@ -253,6 +256,24 @@ std::string make_exec_result_json_line(const std::string &id,
 	json += "\",\"duration_ms\":";
 	json += std::to_string(result.duration_ms);
 	json += "}\n";
+	return json;
+}
+
+std::string make_status_json_line(const std::string &id, const StatusSnapshot &snapshot)
+{
+	std::string json = "{\"event\":\"status\",\"id\":\"";
+	json += json_escape(id);
+	json += "\",\"transport\":\"";
+	json += transport_to_string(snapshot.transport);
+	json += "\",\"session_active\":";
+	json += snapshot.session_active ? "true" : "false";
+	json += ",\"errorlevel\":";
+	json += std::to_string(snapshot.errorlevel);
+	json += ",\"drive\":\"";
+	json += json_escape(snapshot.drive);
+	json += "\",\"cwd\":\"";
+	json += json_escape(snapshot.cwd);
+	json += "\"}\n";
 	return json;
 }
 

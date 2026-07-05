@@ -1,9 +1,11 @@
 #include "dosbox.h"
+#include "dos_inc.h"
 #include "host_control.h"
 
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <thread>
 #include <vector>
@@ -12,6 +14,7 @@
 #include <unistd.h>
 #endif
 
+#include "../src/dos/drives.h"
 #include "dosbox_test_fixture.h"
 
 bool DOSBOX_parse_argv();
@@ -27,6 +30,29 @@ std::string make_temp_socket_path()
 	return std::string(dir ? dir : "/tmp") + "/control.sock";
 }
 #endif
+
+class ScopedHostControlDosState {
+public:
+	ScopedHostControlDosState()
+	        : default_drive(DOS_GetDefaultDrive()),
+	          errorlevel(dos.return_code),
+	          z_drive_curdir(Drives[25] ? Drives[25]->curdir : "")
+	{}
+
+	~ScopedHostControlDosState()
+	{
+		dos.return_code = errorlevel;
+		if (Drives[25] != nullptr) {
+			std::strcpy(Drives[25]->curdir, z_drive_curdir.c_str());
+		}
+		DOS_SetDefaultDrive(default_drive);
+	}
+
+private:
+	uint8_t default_drive = 0;
+	uint16_t errorlevel = 0;
+	std::string z_drive_curdir = {};
+};
 
 class DOSBox_HostControlArgvTest : public DOSBoxTestFixture {
 protected:
@@ -111,6 +137,17 @@ TEST(HostControlProtocolTest, ParsesExecRequest)
 	EXPECT_TRUE(request.error.empty());
 }
 
+TEST(HostControlProtocolTest, ParsesStatusRequestWithoutCommand)
+{
+	const auto request = host_control::parse_request_line(R"({"id":"42","op":"status"})");
+
+	EXPECT_TRUE(request.ok);
+	EXPECT_EQ(request.id, "42");
+	EXPECT_EQ(request.op, "status");
+	EXPECT_TRUE(request.command.empty());
+	EXPECT_TRUE(request.error.empty());
+}
+
 TEST(HostControlProtocolTest, RejectsUnsupportedOperation)
 {
 	const auto request = host_control::parse_request_line(R"({"id":"42","op":"shutdown"})");
@@ -118,6 +155,32 @@ TEST(HostControlProtocolTest, RejectsUnsupportedOperation)
 	EXPECT_FALSE(request.ok);
 	EXPECT_EQ(request.id, "42");
 	EXPECT_EQ(request.error, "unsupported op");
+}
+
+TEST(HostControlProtocolTest, StatusLineReportsSessionState)
+{
+	host_control::StatusSnapshot status = {};
+	status.transport = host_control::Transport::Socket;
+	status.session_active = true;
+	status.errorlevel = 7;
+	status.drive = "Z";
+	status.cwd = "Z:\\BUILD";
+
+	EXPECT_EQ(host_control::make_status_json_line("42", status),
+	          "{\"event\":\"status\",\"id\":\"42\",\"transport\":\"socket\",\"session_active\":true,\"errorlevel\":7,\"drive\":\"Z\",\"cwd\":\"Z:\\\\BUILD\"}\n");
+}
+
+TEST(HostControlProtocolTest, StatusLineEscapesPathFields)
+{
+	host_control::StatusSnapshot status = {};
+	status.transport = host_control::Transport::Stdio;
+	status.session_active = true;
+	status.errorlevel = 0;
+	status.drive = "C";
+	status.cwd = "C:\\TMP\\\"QUOTED\"";
+
+	EXPECT_EQ(host_control::make_status_json_line("77", status),
+	          "{\"event\":\"status\",\"id\":\"77\",\"transport\":\"stdio\",\"session_active\":true,\"errorlevel\":0,\"drive\":\"C\",\"cwd\":\"C:\\\\TMP\\\\\\\"QUOTED\\\"\"}\n");
 }
 
 TEST(HostControlProtocolTest, OutputLineEscapesPayload)
@@ -278,6 +341,106 @@ TEST(HostControlProtocolTest, SessionRunnerEmitsReadyAndInvalidRequestError)
 	EXPECT_EQ(writes[0],
 	          "{\"event\":\"ready\",\"transport\":\"socket\",\"endpoint\":\"/tmp/dosboxx.sock\"}\n");
 	EXPECT_EQ(writes[1], "{\"event\":\"error\",\"id\":\"42\",\"message\":\"unsupported op\"}\n");
+}
+
+TEST(HostControlProtocolTest, SessionRunnerEmitsStatusWithoutResult)
+{
+	const ScopedHostControlDosState dos_state = {};
+	ASSERT_NE(Drives[25], nullptr);
+	DOS_SetDefaultDrive(25);
+	std::strcpy(Drives[25]->curdir, "");
+	dos.return_code = 0;
+
+	std::vector<std::string> writes = {};
+	std::vector<std::string> requests = {R"({"id":"7","op":"status"})"};
+	std::size_t next_request = 0;
+
+	const auto read_line = [&](std::string &line) {
+		if (next_request >= requests.size()) {
+			line.clear();
+			return false;
+		}
+		line = requests[next_request++];
+		return true;
+	};
+	const auto write_line = [&](const std::string &line) {
+		writes.push_back(line);
+		return true;
+	};
+	const auto exec_request = [&](const host_control::Request &, host_control::CommandResult &) {
+		ADD_FAILURE() << "status must not execute shell commands";
+		return false;
+	};
+
+	const auto session = host_control::run_control_session(
+	        host_control::Options{host_control::Transport::Socket, "/tmp/d.sock"},
+	        read_line,
+	        write_line,
+	        exec_request);
+
+	EXPECT_TRUE(session.started);
+	EXPECT_FALSE(session.had_io_error);
+	ASSERT_EQ(writes.size(), 2u);
+	EXPECT_EQ(writes[0],
+	          "{\"event\":\"ready\",\"transport\":\"socket\",\"endpoint\":\"/tmp/d.sock\"}\n");
+	EXPECT_EQ(writes[1],
+	          "{\"event\":\"status\",\"id\":\"7\",\"transport\":\"socket\",\"session_active\":true,\"errorlevel\":0,\"drive\":\"Z\",\"cwd\":\"Z:\\\\\"}\n");
+}
+
+TEST(HostControlProtocolTest, SessionRunnerStatusReflectsUpdatedStateBetweenCommands)
+{
+	const ScopedHostControlDosState dos_state = {};
+	ASSERT_NE(Drives[25], nullptr);
+	DOS_SetDefaultDrive(25);
+	std::strcpy(Drives[25]->curdir, "");
+	dos.return_code = 0;
+
+	std::vector<std::string> writes = {};
+	std::vector<std::string> requests = {
+	        R"({"id":"1","op":"exec","command":"cd \\build"})",
+	        R"({"id":"2","op":"status"})",
+	};
+	std::size_t next_request = 0;
+
+	const auto read_line = [&](std::string &line) {
+		if (next_request >= requests.size()) {
+			line.clear();
+			return false;
+		}
+		line = requests[next_request++];
+		return true;
+	};
+	const auto write_line = [&](const std::string &line) {
+		writes.push_back(line);
+		return true;
+	};
+	const auto exec_request = [&](const host_control::Request &request,
+	                              host_control::CommandResult &result) {
+		EXPECT_EQ(request.op, "exec");
+		EXPECT_EQ(request.command, "cd \\build");
+		DOS_SetDefaultDrive(25);
+		std::strcpy(Drives[25]->curdir, "BUILD");
+		dos.return_code = 7;
+		result.shell_exit = false;
+		result.errorlevel = 7;
+		result.drive = "Z";
+		result.cwd = "Z:\\BUILD";
+		return true;
+	};
+
+	const auto session = host_control::run_control_session(
+	        host_control::Options{host_control::Transport::Stdio, ""},
+	        read_line,
+	        write_line,
+	        exec_request);
+
+	EXPECT_TRUE(session.started);
+	EXPECT_FALSE(session.had_io_error);
+	ASSERT_EQ(writes.size(), 3u);
+	EXPECT_EQ(writes[0], "{\"event\":\"ready\",\"transport\":\"stdio\"}\n");
+	EXPECT_NE(writes[1].find("\"event\":\"result\""), std::string::npos);
+	EXPECT_EQ(writes[2],
+	          "{\"event\":\"status\",\"id\":\"2\",\"transport\":\"stdio\",\"session_active\":true,\"errorlevel\":7,\"drive\":\"Z\",\"cwd\":\"Z:\\\\BUILD\"}\n");
 }
 
 TEST(HostControlProtocolTest, SessionRunnerFlushesBufferedOutputBeforeStructuredResult)

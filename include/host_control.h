@@ -42,6 +42,14 @@ struct CommandResult {
 	uint64_t duration_ms = 0;
 };
 
+struct StatusSnapshot {
+	Transport transport = Transport::Disabled;
+	bool session_active = false;
+	uint32_t errorlevel = 0;
+	std::string drive = {};
+	std::string cwd = {};
+};
+
 struct SessionResult {
 	bool started = false;
 	bool had_io_error = false;
@@ -110,6 +118,7 @@ std::string make_output_bytes_json_line(const std::string &id, const uint8_t *da
 std::string make_exec_result_json_line(const std::string &id,
                                        bool ok,
                                        const CommandResult &result);
+std::string make_status_json_line(const std::string &id, const StatusSnapshot &snapshot);
 void reset_buffered_output(BufferedOutput &buffer, const std::string &request_id);
 void append_buffered_output(BufferedOutput &buffer, const uint8_t *data, std::size_t size, uint64_t now_ms);
 bool has_buffered_output(const BufferedOutput &buffer);
