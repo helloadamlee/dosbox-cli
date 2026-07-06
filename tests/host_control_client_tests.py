@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import os
 import signal
 import socket
@@ -260,8 +261,11 @@ class HostControlClientTest(unittest.TestCase):
         module = load_client_module()
 
         self.assertEqual(module.parse_repl_command("status"), ("status", None))
+        self.assertEqual(module.parse_repl_command("  status  "), ("status", None))
         self.assertEqual(module.parse_repl_command("exec dir"), ("exec", "dir"))
         self.assertEqual(module.parse_repl_command("input dir"), ("input_text", "dir"))
+        self.assertEqual(module.parse_repl_command("input dir  \n"), ("input_text", "dir  "))
+        self.assertEqual(module.parse_repl_command("input  dir"), ("input_text", " dir"))
         self.assertEqual(module.parse_repl_command("key enter"), ("key", "enter"))
         self.assertEqual(module.parse_repl_command("quit"), ("quit", None))
         self.assertEqual(module.parse_repl_command("help"), ("help", None))
@@ -420,6 +424,49 @@ class HostControlClientTest(unittest.TestCase):
             self.assertIn("timed out waiting for status request 1", proc.stderr)
             self.assertEqual(requests, ['{"id":"1","op":"status"}\n'])
 
+    def test_stdio_repl_rejects_input_commands_without_sending_requests(self):
+        module = load_client_module()
+
+        class FakeTransport(module.BufferedLineTransport):
+            def __init__(self):
+                super().__init__()
+                self._read_buffer.extend(b'{"event":"ready","transport":"stdio"}\n')
+                self.requests = []
+
+            def read_bytes(self):
+                return b""
+
+            def fileno(self):
+                return -1
+
+            def writeline(self, line):
+                self.requests.append(line)
+
+        class FakeStdout:
+            def __init__(self):
+                self.buffer = io.BytesIO()
+
+            def flush(self):
+                pass
+
+        transport = FakeTransport()
+        old_stdin = sys.stdin
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        try:
+            sys.stdin = io.StringIO("input hi\nkey enter\nquit\n")
+            sys.stdout = FakeStdout()
+            sys.stderr = io.StringIO()
+
+            result = module.run_repl(transport, allow_input=False)
+        finally:
+            sys.stdin = old_stdin
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
+        self.assertEqual(result, 0)
+        self.assertEqual(transport.requests, [])
+
     def test_stdio_requires_control_stdio_flag(self):
         proc = subprocess.run(
             [
@@ -448,6 +495,29 @@ class HostControlClientTest(unittest.TestCase):
                 str(CLIENT),
                 "stdio",
                 "input-text",
+                "--",
+                sys.executable,
+                "-c",
+                "",
+                "-control-stdio",
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("input actions are socket-only", proc.stderr)
+
+    def test_stdio_rejects_key_as_socket_only(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(CLIENT),
+                "stdio",
+                "key",
+                "enter",
                 "--",
                 sys.executable,
                 "-c",

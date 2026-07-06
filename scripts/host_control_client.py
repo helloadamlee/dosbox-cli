@@ -38,21 +38,22 @@ def event_completes_request(event, request_id, op):
 
 
 def parse_repl_command(text):
-    text = text.strip()
-    if not text:
+    line = text.rstrip("\r\n")
+    stripped = line.strip()
+    if not stripped:
         return None
-    if text == "status":
+    if stripped == "status":
         return ("status", None)
-    if text == "quit":
+    if stripped == "quit":
         return ("quit", None)
-    if text == "help":
+    if stripped == "help":
         return ("help", None)
-    if text.startswith("exec "):
-        return ("exec", text[5:])
-    if text.startswith("input "):
-        return ("input_text", text[6:])
-    if text.startswith("key "):
-        return ("key", text[4:])
+    if stripped.startswith("exec "):
+        return ("exec", stripped[5:])
+    if line.startswith("input "):
+        return ("input_text", line[6:])
+    if stripped.startswith("key "):
+        return ("key", stripped[4:])
     raise ValueError("unknown command")
 
 
@@ -228,7 +229,7 @@ def run_one_shot(transport, op, command=None, text=None, key=None, timeout=None)
     )
 
 
-def run_repl(transport, timeout=None):
+def run_repl(transport, timeout=None, allow_input=True):
     read_event_line(transport, make_deadline(timeout), "ready event")
     next_request_id = 1
 
@@ -254,6 +255,11 @@ def run_repl(transport, timeout=None):
             return 0
         if op == "help":
             sys.stderr.write("commands: status | exec <command> | input <text> | key <name> | help | quit\n")
+            sys.stderr.flush()
+            continue
+
+        if op in ("input_text", "key") and not allow_input:
+            sys.stderr.write("input actions are socket-only\n")
             sys.stderr.flush()
             continue
 
@@ -333,7 +339,7 @@ def main(argv=None):
     aborted = False
     try:
         if args.action == "repl":
-            return run_repl(transport, args.timeout)
+            return run_repl(transport, args.timeout, allow_input=args.transport == "socket")
         if args.action == "input-text":
             return run_one_shot(transport, "input_text", text=args.command, timeout=args.timeout)
         if args.action == "key":
