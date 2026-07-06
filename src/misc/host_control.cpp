@@ -252,6 +252,36 @@ SessionResult run_control_session(const Options &options,
 			continue;
 		}
 
+		if (request.op == "input_text" || request.op == "key") {
+			std::vector<uint16_t> codes = {};
+			std::string error = {};
+			const bool built = request.op == "input_text"
+			                         ? build_input_codes_for_text(request.text, codes, error)
+			                         : build_input_codes_for_key(request.key, codes, error);
+			if (!built) {
+				if (!emit_session_line(make_error_json_line(request.id, error))) {
+					result.had_io_error = true;
+					break;
+				}
+				continue;
+			}
+
+			const auto queued = queue_input_codes(codes);
+			if (!queued.ok) {
+				if (!emit_session_line(make_error_json_line(request.id, queued.error))) {
+					result.had_io_error = true;
+					break;
+				}
+				continue;
+			}
+
+			if (!emit_session_line(make_input_result_json_line(request.id, true, queued.queued))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
 		if (request.op != "exec") {
 			if (!emit_session_line(make_error_json_line(request.id, "unsupported op"))) {
 				result.had_io_error = true;

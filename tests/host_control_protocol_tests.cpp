@@ -528,46 +528,148 @@ TEST(HostControlProtocolTest, SessionRunnerEmitsReadyAndInvalidRequestError)
 	EXPECT_EQ(writes[1], "{\"event\":\"error\",\"id\":\"42\",\"message\":\"unsupported op\"}\n");
 }
 
-TEST(HostControlProtocolTest, SessionRunnerRejectsInputTextBeforeExec)
+TEST(HostControlProtocolTest, SessionRunnerQueuesInputText)
+{
+	host_control::clear_queued_input();
+	std::vector<std::string> writes = {};
+	std::vector<std::string> requests = {R"({"id":"7","op":"input_text","text":"dir\n"})"};
+	std::size_t next_request = 0;
+
+	const auto read_line = [&](std::string &line) {
+		if (next_request >= requests.size()) {
+			return false;
+		}
+		line = requests[next_request++];
+		return true;
+	};
+
+	const auto write_line = [&](const std::string &line) {
+		writes.push_back(line);
+		return true;
+	};
+
+	const auto result = host_control::run_control_session(
+	        {host_control::Transport::Socket, "/tmp/test.sock"},
+	        read_line,
+	        write_line,
+	        [](const host_control::Request &, host_control::CommandResult &) { return false; });
+
+	EXPECT_TRUE(result.started);
+	ASSERT_EQ(writes.size(), 2u);
+	EXPECT_EQ(writes[1], "{\"event\":\"input_result\",\"id\":\"7\",\"ok\":true,\"queued\":4}\n");
+
+	std::vector<uint16_t> drained = {};
+	EXPECT_EQ(host_control::drain_queued_input_codes_for_test(drained, 8), 4u);
+	host_control::clear_queued_input();
+}
+
+TEST(HostControlProtocolTest, SessionRunnerRejectsUnsupportedInputKey)
 {
 	std::vector<std::string> writes = {};
-	std::vector<std::string> requests = {R"({"id":"7","op":"input_text","text":"dir\r"})"};
+	std::vector<std::string> requests = {R"({"id":"8","op":"key","key":"f1"})"};
+	std::size_t next_request = 0;
+
+	const auto read_line = [&](std::string &line) {
+		if (next_request >= requests.size()) {
+			return false;
+		}
+		line = requests[next_request++];
+		return true;
+	};
+
+	const auto write_line = [&](const std::string &line) {
+		writes.push_back(line);
+		return true;
+	};
+
+	(void)host_control::run_control_session(
+	        {host_control::Transport::Socket, "/tmp/test.sock"},
+	        read_line,
+	        write_line,
+	        [](const host_control::Request &, host_control::CommandResult &) { return false; });
+
+	ASSERT_EQ(writes.size(), 2u);
+	EXPECT_EQ(writes[1], "{\"event\":\"error\",\"id\":\"8\",\"message\":\"unsupported key\"}\n");
+}
+
+TEST(HostControlProtocolTest, SessionRunnerQueuesInputKey)
+{
+	host_control::clear_queued_input();
+	std::vector<std::string> writes = {};
+	std::vector<std::string> requests = {R"({"id":"9","op":"key","key":"enter"})"};
 	std::size_t next_request = 0;
 	bool exec_called = false;
 
 	const auto read_line = [&](std::string &line) {
 		if (next_request >= requests.size()) {
-			line.clear();
 			return false;
 		}
-
 		line = requests[next_request++];
 		return true;
 	};
+
 	const auto write_line = [&](const std::string &line) {
 		writes.push_back(line);
 		return true;
 	};
-	const auto exec_request = [&](const host_control::Request &request,
-	                              host_control::CommandResult &) {
-		exec_called = true;
-		EXPECT_EQ(request.op, "input_text");
-		return false;
+
+	const auto result = host_control::run_control_session(
+	        {host_control::Transport::Socket, "/tmp/test.sock"},
+	        read_line,
+	        write_line,
+	        [&](const host_control::Request &, host_control::CommandResult &) {
+		        exec_called = true;
+		        return false;
+	        });
+
+	EXPECT_TRUE(result.started);
+	EXPECT_FALSE(exec_called);
+	ASSERT_EQ(writes.size(), 2u);
+	EXPECT_EQ(writes[1], "{\"event\":\"input_result\",\"id\":\"9\",\"ok\":true,\"queued\":1}\n");
+
+	std::vector<uint16_t> drained = {};
+	EXPECT_EQ(host_control::drain_queued_input_codes_for_test(drained, 8), 1u);
+	host_control::clear_queued_input();
+}
+
+TEST(HostControlProtocolTest, SessionRunnerReportsInputQueueFullWithoutExec)
+{
+	host_control::clear_queued_input();
+	const std::vector<uint16_t> fill_codes(1024, static_cast<uint16_t>('x'));
+	ASSERT_TRUE(host_control::queue_input_codes(fill_codes).ok);
+
+	std::vector<std::string> writes = {};
+	std::vector<std::string> requests = {R"({"id":"10","op":"key","key":"enter"})"};
+	std::size_t next_request = 0;
+	bool exec_called = false;
+
+	const auto read_line = [&](std::string &line) {
+		if (next_request >= requests.size()) {
+			return false;
+		}
+		line = requests[next_request++];
+		return true;
+	};
+
+	const auto write_line = [&](const std::string &line) {
+		writes.push_back(line);
+		return true;
 	};
 
 	const auto result = host_control::run_control_session(
-	        host_control::Options{host_control::Transport::Socket, "/tmp/d.sock"},
+	        {host_control::Transport::Socket, "/tmp/test.sock"},
 	        read_line,
 	        write_line,
-	        exec_request);
+	        [&](const host_control::Request &, host_control::CommandResult &) {
+		        exec_called = true;
+		        return false;
+	        });
 
 	EXPECT_TRUE(result.started);
-	EXPECT_FALSE(result.had_io_error);
 	EXPECT_FALSE(exec_called);
 	ASSERT_EQ(writes.size(), 2u);
-	EXPECT_EQ(writes[0],
-	          "{\"event\":\"ready\",\"transport\":\"socket\",\"endpoint\":\"/tmp/d.sock\"}\n");
-	EXPECT_EQ(writes[1], "{\"event\":\"error\",\"id\":\"7\",\"message\":\"unsupported op\"}\n");
+	EXPECT_EQ(writes[1], "{\"event\":\"error\",\"id\":\"10\",\"message\":\"input queue full\"}\n");
+	host_control::clear_queued_input();
 }
 
 TEST(HostControlProtocolTest, SessionRunnerEmitsStatusWithoutResult)
