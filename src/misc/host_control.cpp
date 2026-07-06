@@ -4,7 +4,11 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <map>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/socket.h>
@@ -21,12 +25,15 @@ namespace {
 
 constexpr std::size_t buffered_output_max_bytes = 4096;
 constexpr uint64_t buffered_output_max_ms = 100;
+constexpr std::size_t input_queue_max_codes = 1024;
 
 bool session_active = false;
 bool session_write_failed = false;
 std::string active_request_id = {};
 BufferedOutput buffered_output = {};
 WriteLineFn active_write_line = {};
+std::deque<uint16_t> pending_input_codes = {};
+std::mutex pending_input_mutex = {};
 
 uint64_t get_monotonic_ms()
 {
@@ -448,6 +455,100 @@ bool run_socket_shell()
 	close_socket_server(server);
 	return result.started;
 #endif
+}
+
+bool build_input_codes_for_text(const std::string &text,
+                                std::vector<uint16_t> &codes,
+                                std::string &error)
+{
+	codes.clear();
+	error.clear();
+
+	for (const auto ch : text) {
+		const auto byte = static_cast<unsigned char>(ch);
+		if (byte == '\r' || byte == '\n') {
+			codes.push_back(0x1c0d);
+			continue;
+		}
+		if (byte < 0x20 || byte > 0x7e) {
+			error = "input_text supports ASCII only";
+			codes.clear();
+			return false;
+		}
+		codes.push_back(static_cast<uint16_t>(byte));
+	}
+
+	return true;
+}
+
+bool build_input_codes_for_key(const std::string &key,
+                               std::vector<uint16_t> &codes,
+                               std::string &error)
+{
+	static const std::map<std::string, uint16_t> named_keys = {
+	        {"enter", 0x1c0d},
+	        {"escape", 0x011b},
+	        {"tab", 0x0f09},
+	        {"backspace", 0x0e08},
+	        {"up", 0x4800},
+	        {"down", 0x5000},
+	        {"left", 0x4b00},
+	        {"right", 0x4d00},
+	};
+
+	codes.clear();
+	error.clear();
+
+	const auto it = named_keys.find(key);
+	if (it == named_keys.end()) {
+		error = "unsupported key";
+		return false;
+	}
+
+	codes.push_back(it->second);
+	return true;
+}
+
+InputQueueResult queue_input_codes(const std::vector<uint16_t> &codes)
+{
+	InputQueueResult result = {};
+	std::lock_guard<std::mutex> lock(pending_input_mutex);
+
+	if (pending_input_codes.size() + codes.size() > input_queue_max_codes) {
+		result.error = "input queue full";
+		return result;
+	}
+
+	for (const auto code : codes) {
+		pending_input_codes.push_back(code);
+	}
+
+	result.ok = true;
+	result.queued = codes.size();
+	return result;
+}
+
+void clear_queued_input()
+{
+	std::lock_guard<std::mutex> lock(pending_input_mutex);
+	pending_input_codes.clear();
+}
+
+std::size_t drain_queued_input()
+{
+	return 0;
+}
+
+std::size_t drain_queued_input_codes_for_test(std::vector<uint16_t> &codes, const std::size_t max_codes)
+{
+	std::lock_guard<std::mutex> lock(pending_input_mutex);
+	std::size_t drained = 0;
+	while (drained < max_codes && !pending_input_codes.empty()) {
+		codes.push_back(pending_input_codes.front());
+		pending_input_codes.pop_front();
+		++drained;
+	}
+	return drained;
 }
 
 void capture_dos_write(const uint16_t info, const char *name, const uint8_t *data, const std::size_t size)

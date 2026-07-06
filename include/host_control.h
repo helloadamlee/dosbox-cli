@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace host_control {
 
@@ -55,6 +56,12 @@ struct StatusSnapshot {
 struct SessionResult {
 	bool started = false;
 	bool had_io_error = false;
+};
+
+struct InputQueueResult {
+	bool ok = false;
+	std::size_t queued = 0;
+	std::string error = {};
 };
 
 struct SocketServer {
@@ -143,6 +150,16 @@ bool run_pipe_shell();
 bool open_socket_server(const std::string &path, SocketServer &server, std::string &error);
 void close_socket_server(SocketServer &server);
 bool run_socket_shell();
+bool build_input_codes_for_text(const std::string &text,
+                                std::vector<uint16_t> &codes,
+                                std::string &error);
+bool build_input_codes_for_key(const std::string &key,
+                               std::vector<uint16_t> &codes,
+                               std::string &error);
+InputQueueResult queue_input_codes(const std::vector<uint16_t> &codes);
+void clear_queued_input();
+std::size_t drain_queued_input();
+std::size_t drain_queued_input_codes_for_test(std::vector<uint16_t> &codes, std::size_t max_codes);
 void capture_dos_write(uint16_t info, const char *name, const uint8_t *data, std::size_t size);
 
 } // namespace host_control

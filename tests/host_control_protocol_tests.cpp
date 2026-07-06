@@ -189,6 +189,75 @@ TEST(HostControlProtocolTest, RejectsKeyWithEmptyKeyName)
 	EXPECT_EQ(request.error, "missing key");
 }
 
+TEST(HostControlProtocolTest, BuildsAsciiInputCodesForText)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+
+	EXPECT_TRUE(host_control::build_input_codes_for_text("dir\n", codes, error));
+	ASSERT_EQ(codes.size(), 4u);
+	EXPECT_EQ(codes[0], static_cast<uint16_t>('d'));
+	EXPECT_EQ(codes[1], static_cast<uint16_t>('i'));
+	EXPECT_EQ(codes[2], static_cast<uint16_t>('r'));
+	EXPECT_EQ(codes[3], 0x1c0d);
+	EXPECT_TRUE(error.empty());
+}
+
+TEST(HostControlProtocolTest, RejectsNonAsciiInputText)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+
+	EXPECT_FALSE(host_control::build_input_codes_for_text(std::string("\xC3\xA9", 2), codes, error));
+	EXPECT_TRUE(codes.empty());
+	EXPECT_EQ(error, "input_text supports ASCII only");
+}
+
+TEST(HostControlProtocolTest, BuildsNamedKeyCodes)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+
+	EXPECT_TRUE(host_control::build_input_codes_for_key("enter", codes, error));
+	ASSERT_EQ(codes.size(), 1u);
+	EXPECT_EQ(codes[0], 0x1c0d);
+
+	codes.clear();
+	EXPECT_TRUE(host_control::build_input_codes_for_key("up", codes, error));
+	ASSERT_EQ(codes.size(), 1u);
+	EXPECT_EQ(codes[0], 0x4800);
+}
+
+TEST(HostControlProtocolTest, RejectsUnsupportedNamedKey)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+
+	EXPECT_FALSE(host_control::build_input_codes_for_key("f1", codes, error));
+	EXPECT_TRUE(codes.empty());
+	EXPECT_EQ(error, "unsupported key");
+}
+
+TEST(HostControlProtocolTest, InputQueueAcceptsAndDrainsCodesInOrder)
+{
+	host_control::clear_queued_input();
+
+	std::vector<uint16_t> codes = {static_cast<uint16_t>('d'), static_cast<uint16_t>('i')};
+	const auto queued = host_control::queue_input_codes(codes);
+
+	EXPECT_TRUE(queued.ok);
+	EXPECT_EQ(queued.queued, 2u);
+	EXPECT_TRUE(queued.error.empty());
+
+	std::vector<uint16_t> drained = {};
+	EXPECT_EQ(host_control::drain_queued_input_codes_for_test(drained, 8), 2u);
+	ASSERT_EQ(drained.size(), 2u);
+	EXPECT_EQ(drained[0], static_cast<uint16_t>('d'));
+	EXPECT_EQ(drained[1], static_cast<uint16_t>('i'));
+
+	host_control::clear_queued_input();
+}
+
 TEST(HostControlProtocolTest, ParsesStatusRequestWithoutCommand)
 {
 	const auto request = host_control::parse_request_line(R"({"id":"42","op":"status"})");
