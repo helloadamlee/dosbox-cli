@@ -14,10 +14,14 @@ class RequestTimeout(RuntimeError):
     pass
 
 
-def encode_request(request_id, op, command=None):
+def encode_request(request_id, op, command=None, text=None, key=None):
     payload = {"id": str(request_id), "op": op}
     if command is not None:
         payload["command"] = command
+    if text is not None:
+        payload["text"] = text
+    if key is not None:
+        payload["key"] = key
     return json.dumps(payload, separators=(",", ":"))
 
 
@@ -28,6 +32,8 @@ def event_completes_request(event, request_id, op):
         return True
     if op == "status":
         return event.get("event") == "status"
+    if op in ("input_text", "key"):
+        return event.get("event") == "input_result"
     return event.get("event") == "result"
 
 
@@ -43,6 +49,10 @@ def parse_repl_command(text):
         return ("help", None)
     if text.startswith("exec "):
         return ("exec", text[5:])
+    if text.startswith("input "):
+        return ("input_text", text[6:])
+    if text.startswith("key "):
+        return ("key", text[4:])
     raise ValueError("unknown command")
 
 
@@ -196,18 +206,26 @@ def read_event_line(transport, deadline=None, description="event"):
         raise RuntimeError("received invalid JSON event") from exc
 
 
-def run_request(transport, request_id, op, command=None, timeout=None):
+def run_request(transport, request_id, op, command=None, text=None, key=None, timeout=None):
     deadline = make_deadline(timeout)
-    transport.writeline(encode_request(request_id, op, command))
+    transport.writeline(encode_request(request_id, op, command, text, key))
     while True:
         event = read_event_line(transport, deadline, f"{op} request {request_id}")
         if event_completes_request(event, request_id, op):
             return 0
 
 
-def run_one_shot(transport, op, command=None, timeout=None):
+def run_one_shot(transport, op, command=None, text=None, key=None, timeout=None):
     read_event_line(transport, make_deadline(timeout), "ready event")
-    return run_request(transport, 1, op, command, timeout)
+    return run_request(
+        transport,
+        1,
+        op,
+        command=command,
+        text=text,
+        key=key,
+        timeout=timeout,
+    )
 
 
 def run_repl(transport, timeout=None):
@@ -224,7 +242,7 @@ def run_repl(transport, timeout=None):
         try:
             parsed = parse_repl_command(line)
         except ValueError:
-            sys.stderr.write("commands: status | exec <command> | help | quit\n")
+            sys.stderr.write("commands: status | exec <command> | input <text> | key <name> | help | quit\n")
             sys.stderr.flush()
             continue
 
@@ -235,11 +253,16 @@ def run_repl(transport, timeout=None):
         if op == "quit":
             return 0
         if op == "help":
-            sys.stderr.write("commands: status | exec <command> | help | quit\n")
+            sys.stderr.write("commands: status | exec <command> | input <text> | key <name> | help | quit\n")
             sys.stderr.flush()
             continue
 
-        run_request(transport, next_request_id, op, command, timeout)
+        if op == "input_text":
+            run_request(transport, next_request_id, op, text=command, timeout=timeout)
+        elif op == "key":
+            run_request(transport, next_request_id, op, key=command, timeout=timeout)
+        else:
+            run_request(transport, next_request_id, op, command=command, timeout=timeout)
         next_request_id += 1
 
 
@@ -255,11 +278,11 @@ def parse_args(argv):
 
     socket_parser = subparsers.add_parser("socket")
     socket_parser.add_argument("path")
-    socket_parser.add_argument("action", choices=("status", "exec", "repl"))
+    socket_parser.add_argument("action", choices=("status", "exec", "input-text", "key", "repl"))
     socket_parser.add_argument("command", nargs="?")
 
     stdio_parser = subparsers.add_parser("stdio")
-    stdio_parser.add_argument("action", choices=("status", "exec", "repl"))
+    stdio_parser.add_argument("action", choices=("status", "exec", "input-text", "key", "repl"))
     stdio_parser.add_argument("command", nargs="?")
     stdio_parser.add_argument("spawn_command", nargs=argparse.REMAINDER)
 
@@ -267,6 +290,11 @@ def parse_args(argv):
 
     if args.timeout is not None and args.timeout <= 0:
         parser.error("timeout must be greater than zero")
+
+    if args.transport == "stdio" and args.action in ("input-text", "key"):
+        parser.error("input actions are socket-only")
+    if args.action in ("input-text", "key") and not args.command:
+        parser.error(f"{args.action} requires a value")
 
     if args.transport == "stdio":
         if args.action != "exec" and args.command is not None:
@@ -306,7 +334,11 @@ def main(argv=None):
     try:
         if args.action == "repl":
             return run_repl(transport, args.timeout)
-        return run_one_shot(transport, args.action, args.command, args.timeout)
+        if args.action == "input-text":
+            return run_one_shot(transport, "input_text", text=args.command, timeout=args.timeout)
+        if args.action == "key":
+            return run_one_shot(transport, "key", key=args.command, timeout=args.timeout)
+        return run_one_shot(transport, args.action, command=args.command, timeout=args.timeout)
     except RequestTimeout as exc:
         print(str(exc), file=sys.stderr)
         transport.abort()

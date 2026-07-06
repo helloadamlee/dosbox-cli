@@ -122,6 +122,52 @@ class HostControlClientTest(unittest.TestCase):
             self.assertEqual(proc.stdout, "".join(lines))
             self.assertEqual(requests, ['{"id":"1","op":"exec","command":"echo hi"}\n'])
 
+    def test_socket_input_text_sends_request_and_waits_for_input_result(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"input_result","id":"1","ok":true,"queued":4}\n',
+            ]
+            thread = self._serve_socket_once(sock_path, lines, requests)
+
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "socket", sock_path, "input-text", "dir\n"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.join(timeout=2)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertEqual(requests, ['{"id":"1","op":"input_text","text":"dir\\n"}\n'])
+
+    def test_socket_key_sends_request_and_waits_for_input_result(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"input_result","id":"1","ok":true,"queued":1}\n',
+            ]
+            thread = self._serve_socket_once(sock_path, lines, requests)
+
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "socket", sock_path, "key", "enter"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.join(timeout=2)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertEqual(requests, ['{"id":"1","op":"key","key":"enter"}\n'])
+
     def test_stdio_status_spawns_child_and_reads_ready_then_status(self):
         stub = textwrap.dedent(
             """
@@ -215,6 +261,8 @@ class HostControlClientTest(unittest.TestCase):
 
         self.assertEqual(module.parse_repl_command("status"), ("status", None))
         self.assertEqual(module.parse_repl_command("exec dir"), ("exec", "dir"))
+        self.assertEqual(module.parse_repl_command("input dir"), ("input_text", "dir"))
+        self.assertEqual(module.parse_repl_command("key enter"), ("key", "enter"))
         self.assertEqual(module.parse_repl_command("quit"), ("quit", None))
         self.assertEqual(module.parse_repl_command("help"), ("help", None))
         self.assertIsNone(module.parse_repl_command(""))
@@ -392,6 +440,28 @@ class HostControlClientTest(unittest.TestCase):
 
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("-control-stdio", proc.stderr)
+
+    def test_stdio_rejects_input_text_as_socket_only(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(CLIENT),
+                "stdio",
+                "input-text",
+                "--",
+                sys.executable,
+                "-c",
+                "",
+                "-control-stdio",
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("input actions are socket-only", proc.stderr)
 
 
 if __name__ == "__main__":
