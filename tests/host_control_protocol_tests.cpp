@@ -106,6 +106,9 @@ TEST_F(DOSBox_HostControlArgvTest, ParsesControlPipePath)
 	ParseArgs("-control-pipe /tmp/dosboxx.pipe");
 	EXPECT_EQ(control->opt_host_control.transport, host_control::Transport::Pipe);
 	EXPECT_EQ(control->opt_host_control.endpoint, "/tmp/dosboxx.pipe");
+	EXPECT_TRUE(host_control::is_pipe_enabled(control->opt_host_control));
+	EXPECT_FALSE(host_control::is_stdio_enabled(control->opt_host_control));
+	EXPECT_FALSE(host_control::is_socket_enabled(control->opt_host_control));
 }
 
 TEST_F(DOSBox_HostControlArgvTest, ParsesHeadlessFlag)

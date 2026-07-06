@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import select
 import socket
 import subprocess
@@ -45,50 +46,73 @@ def parse_repl_command(text):
     raise ValueError("unknown command")
 
 
-class SocketTransport:
+class BufferedLineTransport:
+    def __init__(self):
+        self._read_buffer = bytearray()
+
+    def read_bytes(self):
+        raise NotImplementedError
+
+    def has_buffered_line(self):
+        return b"\n" in self._read_buffer
+
+    def read_available(self):
+        chunk = self.read_bytes()
+        if not chunk:
+            return False
+        self._read_buffer.extend(chunk)
+        return True
+
+    def pop_line(self):
+        newline = self._read_buffer.find(b"\n")
+        if newline < 0:
+            if not self._read_buffer:
+                return b""
+            line = bytes(self._read_buffer)
+            self._read_buffer.clear()
+            return line
+
+        end = newline + 1
+        line = bytes(self._read_buffer[:end])
+        del self._read_buffer[:end]
+        return line
+
+
+class SocketTransport(BufferedLineTransport):
     def __init__(self, path):
+        super().__init__()
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.socket.connect(path)
-        self.reader = self.socket.makefile("r", encoding="utf-8", newline="\n")
-        self.writer = self.socket.makefile("w", encoding="utf-8", newline="\n")
 
-    def readline(self):
-        return self.reader.readline()
+    def read_bytes(self):
+        return self.socket.recv(4096)
 
     def fileno(self):
-        return self.reader.fileno()
+        return self.socket.fileno()
 
     def writeline(self, line):
-        self.writer.write(line)
-        self.writer.write("\n")
-        self.writer.flush()
+        self.socket.sendall(line.encode("utf-8") + b"\n")
 
     def close(self):
-        try:
-            self.writer.close()
-        finally:
-            try:
-                self.reader.close()
-            finally:
-                self.socket.close()
+        self.socket.close()
 
     def abort(self):
         self.close()
 
 
-class StdioTransport:
+class StdioTransport(BufferedLineTransport):
     def __init__(self, command):
+        super().__init__()
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=None,
-            text=True,
         )
 
-    def readline(self):
+    def read_bytes(self):
         assert self.process.stdout is not None
-        return self.process.stdout.readline()
+        return os.read(self.process.stdout.fileno(), 4096)
 
     def fileno(self):
         assert self.process.stdout is not None
@@ -96,8 +120,7 @@ class StdioTransport:
 
     def writeline(self, line):
         assert self.process.stdin is not None
-        self.process.stdin.write(line)
-        self.process.stdin.write("\n")
+        self.process.stdin.write(line.encode("utf-8") + b"\n")
         self.process.stdin.flush()
 
     def close_stdin(self):
@@ -156,15 +179,20 @@ def wait_for_readable(transport, deadline, description):
 
 
 def read_event_line(transport, deadline=None, description="event"):
-    wait_for_readable(transport, deadline, description)
-    line = transport.readline()
-    if not line:
+    while not transport.has_buffered_line():
+        wait_for_readable(transport, deadline, description)
+        if not transport.read_available():
+            break
+
+    raw_line = transport.pop_line()
+    if not raw_line:
         raise RuntimeError("unexpected EOF from host control transport")
-    sys.stdout.write(line)
+    sys.stdout.buffer.write(raw_line)
     sys.stdout.flush()
     try:
+        line = raw_line.decode("utf-8")
         return json.loads(line)
-    except json.JSONDecodeError as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError("received invalid JSON event") from exc
 
 

@@ -29,7 +29,7 @@ path when the session ends.
 
 ### Pipe
 
-`-control-pipe <path>` is parsed, but pipe transport is not implemented yet.
+`-control-pipe <path>` is parsed, but pipe transport is not implemented yet. It exits the host-control startup path with a clear stderr message instead of starting a normal interactive shell.
 
 ## Requests
 

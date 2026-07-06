@@ -1309,6 +1309,38 @@ void DOS_Shell::Run(void) {
 	shellrun=false;
 }
 
+static bool try_execute_host_native_command(const char *input_line)
+{
+	std::string line = input_line;
+	if (line.empty()) {
+		return false;
+	}
+
+	char *mutable_line = &line[0];
+	char *command = trim(mutable_line);
+	if (*command == 0) {
+		return false;
+	}
+
+	char *args = command;
+	while (*args != 0 && *args != ' ' && *args != '\t' && *args != '=') {
+		++args;
+	}
+
+	if (*args != 0) {
+		*args = 0;
+		++args;
+		args = trim(args);
+	}
+
+	if (strcasecmp(command, "mount") == 0 || strcasecmp(command, "mount.com") == 0) {
+		runMount(args);
+		return true;
+	}
+
+	return false;
+}
+
 bool SHELL_ExecuteHostCommand(const std::string &command, bool &shell_exit)
 {
 	shell_exit = true;
@@ -1330,7 +1362,9 @@ bool SHELL_ExecuteHostCommand(const std::string &command, bool &shell_exit)
 			DOS_FlushSTDIN();
 		}
 
-		first_shell->ParseLine(input_line);
+		if (!try_execute_host_native_command(input_line)) {
+			first_shell->ParseLine(input_line);
+		}
 
 		if (shell_keyboard_flush) {
 			DOS_FlushSTDIN();
@@ -2285,6 +2319,8 @@ void SHELL_Run() {
 			host_control::run_stdio_shell();
 		else if (host_control::is_socket_enabled(control->opt_host_control))
 			host_control::run_socket_shell();
+		else if (host_control::is_pipe_enabled(control->opt_host_control))
+			host_control::run_pipe_shell();
 		else
 			first_shell->Run();
 		delete first_shell;

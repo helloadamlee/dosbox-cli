@@ -355,4 +355,9 @@ bool is_socket_enabled(const Options &options)
 	return options.transport == Transport::Socket;
 }
 
+bool is_pipe_enabled(const Options &options)
+{
+	return options.transport == Transport::Pipe;
+}
+
 } // namespace host_control

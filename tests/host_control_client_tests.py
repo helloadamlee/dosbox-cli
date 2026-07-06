@@ -161,6 +161,55 @@ class HostControlClientTest(unittest.TestCase):
             '{"event":"status","id":"1","transport":"stdio","session_active":true,"errorlevel":0,"drive":"Z","cwd":"Z:\\\\"}\n',
         )
 
+    def test_stdio_exec_reads_result_buffered_after_output(self):
+        stub = textwrap.dedent(
+            """
+            import os
+            import sys
+            import time
+
+            os.write(sys.stdout.fileno(), b'{"event":"ready","transport":"stdio"}\\n')
+            request = sys.stdin.readline()
+            assert request == '{"id":"1","op":"exec","command":"echo hi"}\\n', request
+            os.write(
+                sys.stdout.fileno(),
+                b'{"event":"output","id":"1","encoding":"base64","data":"aGkNCg=="}\\n'
+                b'{"event":"result","id":"1","ok":true,"shell_exit":false,"errorlevel":0,"drive":"Z","cwd":"Z:\\\\\\\\","duration_ms":1}\\n',
+            )
+            sys.stdout.flush()
+            time.sleep(1.0)
+            """
+        )
+
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(CLIENT),
+                "--timeout",
+                "0.1",
+                "stdio",
+                "exec",
+                "echo hi",
+                "--",
+                sys.executable,
+                "-c",
+                stub,
+                "-control-stdio",
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout,
+            '{"event":"ready","transport":"stdio"}\n'
+            '{"event":"output","id":"1","encoding":"base64","data":"aGkNCg=="}\n'
+            '{"event":"result","id":"1","ok":true,"shell_exit":false,"errorlevel":0,"drive":"Z","cwd":"Z:\\\\","duration_ms":1}\n',
+        )
+
     def test_repl_command_parser(self):
         module = load_client_module()
 

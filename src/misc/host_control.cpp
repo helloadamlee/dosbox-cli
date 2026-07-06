@@ -82,33 +82,6 @@ bool emit_session_line(const std::string &line)
 	return true;
 }
 
-bool read_stdin_line(std::string &line)
-{
-	line.clear();
-
-	char buffer[4096] = {};
-	if (std::fgets(buffer, sizeof(buffer), stdin) == nullptr) {
-		return false;
-	}
-
-	line.assign(buffer);
-	while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
-		line.pop_back();
-	}
-
-	return true;
-}
-
-bool write_stdout_line(const std::string &line)
-{
-	if (line.empty()) {
-		return true;
-	}
-
-	return std::fwrite(line.data(), 1, line.size(), stdout) == line.size() &&
-	       std::fflush(stdout) == 0;
-}
-
 void reset_session_state()
 {
 	reset_buffered_output(buffered_output, {});
@@ -186,6 +159,33 @@ void close_fd(int &fd)
 		(void)close(fd);
 		fd = -1;
 	}
+}
+#else
+bool read_stdin_line(std::string &line)
+{
+	line.clear();
+
+	char buffer[4096] = {};
+	if (std::fgets(buffer, sizeof(buffer), stdin) == nullptr) {
+		return false;
+	}
+
+	line.assign(buffer);
+	while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+		line.pop_back();
+	}
+
+	return true;
+}
+
+bool write_stdout_line(const std::string &line)
+{
+	if (line.empty()) {
+		return true;
+	}
+
+	return std::fwrite(line.data(), 1, line.size(), stdout) == line.size() &&
+	       std::fflush(stdout) == 0;
 }
 #endif
 
@@ -275,6 +275,33 @@ bool run_stdio_shell()
 		return false;
 	}
 
+#if defined(__unix__) || defined(__APPLE__)
+	int stdin_fd = dup(STDIN_FILENO);
+	int stdout_fd = dup(STDOUT_FILENO);
+	if (stdin_fd < 0 || stdout_fd < 0) {
+		std::fprintf(stderr, "%s\n", std::strerror(errno));
+		std::fflush(stderr);
+		close_fd(stdin_fd);
+		close_fd(stdout_fd);
+		return false;
+	}
+
+	const auto result = run_control_session(
+	        control->opt_host_control,
+	        [stdin_fd](std::string &line) { return read_fd_line(stdin_fd, line); },
+	        [stdout_fd](const std::string &line) { return write_fd_line(stdout_fd, line); },
+	        [](const Request &request, CommandResult &result) {
+		        const bool ok = SHELL_ExecuteHostCommand(request.command, result.shell_exit);
+		        if (ok) {
+			        populate_command_result(result);
+		        }
+		        return ok;
+	        });
+
+	close_fd(stdin_fd);
+	close_fd(stdout_fd);
+	return result.started;
+#else
 	const auto result = run_control_session(
 	        control->opt_host_control,
 	        read_stdin_line,
@@ -287,6 +314,18 @@ bool run_stdio_shell()
 		        return ok;
 	        });
 	return result.started;
+#endif
+}
+
+bool run_pipe_shell()
+{
+	if (control == nullptr || !is_pipe_enabled(control->opt_host_control)) {
+		return false;
+	}
+
+	std::fprintf(stderr, "Host control pipe transport is not implemented\n");
+	std::fflush(stderr);
+	return false;
 }
 
 bool open_socket_server(const std::string &path, SocketServer &server, std::string &error)
