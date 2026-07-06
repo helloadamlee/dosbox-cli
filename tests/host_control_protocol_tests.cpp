@@ -213,19 +213,49 @@ TEST(HostControlProtocolTest, RejectsNonAsciiInputText)
 	EXPECT_EQ(error, "input_text supports ASCII only");
 }
 
+TEST(HostControlProtocolTest, BuildsEnterCodeForCarriageReturn)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+
+	EXPECT_TRUE(host_control::build_input_codes_for_text("\r", codes, error));
+	ASSERT_EQ(codes.size(), 1u);
+	EXPECT_EQ(codes[0], 0x1c0d);
+	EXPECT_TRUE(error.empty());
+}
+
+TEST(HostControlProtocolTest, RejectsControlByteInputText)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+
+	EXPECT_FALSE(host_control::build_input_codes_for_text(std::string("\x1b", 1), codes, error));
+	EXPECT_TRUE(codes.empty());
+	EXPECT_EQ(error, "input_text supports ASCII only");
+}
+
 TEST(HostControlProtocolTest, BuildsNamedKeyCodes)
 {
 	std::vector<uint16_t> codes = {};
 	std::string error = {};
 
-	EXPECT_TRUE(host_control::build_input_codes_for_key("enter", codes, error));
-	ASSERT_EQ(codes.size(), 1u);
-	EXPECT_EQ(codes[0], 0x1c0d);
+	const std::vector<std::pair<std::string, uint16_t>> expected_codes = {
+	        {"enter", 0x1c0d},
+	        {"escape", 0x011b},
+	        {"tab", 0x0f09},
+	        {"backspace", 0x0e08},
+	        {"up", 0x4800},
+	        {"down", 0x5000},
+	        {"left", 0x4b00},
+	        {"right", 0x4d00},
+	};
 
-	codes.clear();
-	EXPECT_TRUE(host_control::build_input_codes_for_key("up", codes, error));
-	ASSERT_EQ(codes.size(), 1u);
-	EXPECT_EQ(codes[0], 0x4800);
+	for (const auto &expected : expected_codes) {
+		EXPECT_TRUE(host_control::build_input_codes_for_key(expected.first, codes, error));
+		ASSERT_EQ(codes.size(), 1u);
+		EXPECT_EQ(codes[0], expected.second);
+		EXPECT_TRUE(error.empty());
+	}
 }
 
 TEST(HostControlProtocolTest, RejectsUnsupportedNamedKey)
@@ -254,6 +284,34 @@ TEST(HostControlProtocolTest, InputQueueAcceptsAndDrainsCodesInOrder)
 	ASSERT_EQ(drained.size(), 2u);
 	EXPECT_EQ(drained[0], static_cast<uint16_t>('d'));
 	EXPECT_EQ(drained[1], static_cast<uint16_t>('i'));
+
+	host_control::clear_queued_input();
+}
+
+TEST(HostControlProtocolTest, InputQueueRejectsOverflowWithoutPartialAppend)
+{
+	host_control::clear_queued_input();
+
+	std::vector<uint16_t> codes(1024, static_cast<uint16_t>('x'));
+	const auto queued = host_control::queue_input_codes(codes);
+
+	EXPECT_TRUE(queued.ok);
+	EXPECT_EQ(queued.queued, 1024u);
+	EXPECT_TRUE(queued.error.empty());
+
+	std::vector<uint16_t> extra = {static_cast<uint16_t>('z')};
+	const auto overflow = host_control::queue_input_codes(extra);
+
+	EXPECT_FALSE(overflow.ok);
+	EXPECT_EQ(overflow.queued, 0u);
+	EXPECT_EQ(overflow.error, "input queue full");
+
+	std::vector<uint16_t> drained = {};
+	EXPECT_EQ(host_control::drain_queued_input_codes_for_test(drained, 1025), 1024u);
+	ASSERT_EQ(drained.size(), 1024u);
+	for (const auto code : drained) {
+		EXPECT_EQ(code, static_cast<uint16_t>('x'));
+	}
 
 	host_control::clear_queued_input();
 }
