@@ -104,6 +104,19 @@ scripts/host_control_client.py stdio exec "echo hi" -- ./src/dosbox-x -control-s
 scripts/host_control_client.py stdio repl -- ./src/dosbox-x -control-stdio -headless -noconfig -noautoexec
 ```
 
+Use `--timeout <seconds>` before the transport to bound how long the client
+waits for each protocol response:
+
+```bash
+scripts/host_control_client.py --timeout 5 socket /tmp/dosboxx.sock exec "echo hi"
+scripts/host_control_client.py --timeout 5 stdio status -- ./src/dosbox-x -control-stdio -headless -noconfig -noautoexec
+```
+
+Timeouts are a client-side recovery feature. In stdio mode, the client owns the
+spawned DOSBox-X process and terminates it on timeout. In socket mode, the client
+closes its socket; DOSBox-X may continue the current DOS command until it returns
+because requests currently execute synchronously.
+
 The client writes raw JSON events to stdout. REPL prompts and local help are
 written to stderr so stdout remains machine-readable.
 
@@ -120,6 +133,6 @@ Current host control is intentionally small:
 
 - one control client per socket session
 - no reconnect loop
-- no command cancellation
+- no server-side command cancellation
 - no input injection for interactive DOS programs
 - no pipe transport implementation

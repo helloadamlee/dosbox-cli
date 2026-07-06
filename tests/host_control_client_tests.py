@@ -1,16 +1,28 @@
 import importlib.util
+import os
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLIENT = REPO_ROOT / "scripts" / "host_control_client.py"
+
+
+def load_client_module():
+    spec = importlib.util.spec_from_file_location("host_control_client", CLIENT)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class HostControlClientTest(unittest.TestCase):
@@ -33,6 +45,34 @@ class HostControlClientTest(unittest.TestCase):
 
         thread = threading.Thread(target=serve, daemon=True)
         thread.start()
+        return thread
+
+    def _serve_socket_hanging_after_lines(self, sock_path, response_lines, requests):
+        ready = threading.Event()
+
+        def serve():
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(sock_path)
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn, server:
+                self.assertGreaterEqual(len(response_lines), 1)
+                conn.sendall(response_lines[0].encode("utf-8"))
+                data = b""
+                while not data.endswith(b"\n"):
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                requests.append(data.decode("utf-8"))
+                for line in response_lines[1:]:
+                    conn.sendall(line.encode("utf-8"))
+                threading.Event().wait(0.5)
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(2.0))
         return thread
 
     def test_socket_status_one_shot_preserves_raw_lines(self):
@@ -122,17 +162,166 @@ class HostControlClientTest(unittest.TestCase):
         )
 
     def test_repl_command_parser(self):
-        spec = importlib.util.spec_from_file_location("host_control_client", CLIENT)
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = load_client_module()
 
         self.assertEqual(module.parse_repl_command("status"), ("status", None))
         self.assertEqual(module.parse_repl_command("exec dir"), ("exec", "dir"))
         self.assertEqual(module.parse_repl_command("quit"), ("quit", None))
         self.assertEqual(module.parse_repl_command("help"), ("help", None))
         self.assertIsNone(module.parse_repl_command(""))
+
+    def test_parse_timeout_option(self):
+        module = load_client_module()
+
+        args = module.parse_args(["--timeout", "2.5", "socket", "/tmp/d.sock", "status"])
+
+        self.assertEqual(args.timeout, 2.5)
+
+    def test_parse_rejects_non_positive_timeout(self):
+        proc = subprocess.run(
+            [sys.executable, str(CLIENT), "--timeout", "0", "socket", "/tmp/d.sock", "status"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("timeout must be greater than zero", proc.stderr)
+
+    def test_socket_timeout_exits_nonzero_when_request_never_completes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            requests = []
+            lines = ['{"event":"ready","transport":"socket"}\n']
+            thread = self._serve_socket_hanging_after_lines(sock_path, lines, requests)
+
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "--timeout", "0.1", "socket", sock_path, "status"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.join(timeout=2)
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertIn("timed out waiting for status request 1", proc.stderr)
+            self.assertEqual(requests, ['{"id":"1","op":"status"}\n'])
+
+    def test_socket_timeout_preserves_output_before_timeout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"output","id":"1","encoding":"base64","data":"aGkNCg=="}\n',
+            ]
+            thread = self._serve_socket_hanging_after_lines(sock_path, lines, requests)
+
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "--timeout", "0.1", "socket", sock_path, "exec", "hang"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.join(timeout=2)
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertIn("timed out waiting for exec request 1", proc.stderr)
+
+    def test_stdio_timeout_terminates_spawned_child(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            marker = Path(tmpdir) / "marker"
+            pidfile = Path(tmpdir) / "child.pid"
+            stub = textwrap.dedent(
+                f"""
+                import os
+                import pathlib
+                import signal
+                import sys
+                import time
+
+                marker = pathlib.Path({str(marker)!r})
+                pidfile = pathlib.Path({str(pidfile)!r})
+                pidfile.write_text(str(os.getpid()))
+
+                def handle_term(signum, frame):
+                    marker.write_text("terminated")
+                    raise SystemExit(0)
+
+                signal.signal(signal.SIGTERM, handle_term)
+                sys.stdout.write('{{"event":"ready","transport":"stdio"}}\\n')
+                sys.stdout.flush()
+                sys.stdin.readline()
+                while True:
+                    time.sleep(0.1)
+                """
+            )
+
+            timed_out = False
+            proc = None
+            try:
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        str(CLIENT),
+                        "--timeout",
+                        "0.1",
+                        "stdio",
+                        "status",
+                        "--",
+                        sys.executable,
+                        "-c",
+                        stub,
+                        "-control-stdio",
+                    ],
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=3.0,
+                )
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            finally:
+                if timed_out and pidfile.exists():
+                    try:
+                        os.kill(int(pidfile.read_text()), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    time.sleep(0.1)
+
+            self.assertFalse(timed_out, "client did not return after request timeout")
+            self.assertIsNotNone(proc)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("timed out waiting for status request 1", proc.stderr)
+            self.assertEqual(marker.read_text(), "terminated")
+
+    def test_repl_socket_timeout_exits_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            requests = []
+            lines = ['{"event":"ready","transport":"socket"}\n']
+            thread = self._serve_socket_hanging_after_lines(sock_path, lines, requests)
+
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "--timeout", "0.1", "socket", sock_path, "repl"],
+                cwd=REPO_ROOT,
+                input="status\n",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.join(timeout=2)
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertIn("timed out waiting for status request 1", proc.stderr)
+            self.assertEqual(requests, ['{"id":"1","op":"status"}\n'])
 
     def test_stdio_requires_control_stdio_flag(self):
         proc = subprocess.run(

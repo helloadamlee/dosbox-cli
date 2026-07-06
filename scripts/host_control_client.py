@@ -2,9 +2,15 @@
 
 import argparse
 import json
+import select
 import socket
 import subprocess
 import sys
+import time
+
+
+class RequestTimeout(RuntimeError):
+    pass
 
 
 def encode_request(request_id, op, command=None):
@@ -49,6 +55,9 @@ class SocketTransport:
     def readline(self):
         return self.reader.readline()
 
+    def fileno(self):
+        return self.reader.fileno()
+
     def writeline(self, line):
         self.writer.write(line)
         self.writer.write("\n")
@@ -62,6 +71,9 @@ class SocketTransport:
                 self.reader.close()
             finally:
                 self.socket.close()
+
+    def abort(self):
+        self.close()
 
 
 class StdioTransport:
@@ -78,23 +90,73 @@ class StdioTransport:
         assert self.process.stdout is not None
         return self.process.stdout.readline()
 
+    def fileno(self):
+        assert self.process.stdout is not None
+        return self.process.stdout.fileno()
+
     def writeline(self, line):
         assert self.process.stdin is not None
         self.process.stdin.write(line)
         self.process.stdin.write("\n")
         self.process.stdin.flush()
 
-    def close(self):
+    def close_stdin(self):
         try:
             if self.process.stdin is not None and not self.process.stdin.closed:
                 self.process.stdin.close()
+        except BrokenPipeError:
+            pass
+
+    def close_stdout(self):
+        if self.process.stdout is not None and not self.process.stdout.closed:
+            self.process.stdout.close()
+
+    def close(self):
+        try:
+            self.close_stdin()
+            if self.process.poll() is None:
+                try:
+                    self.process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    self.abort()
         finally:
-            if self.process.stdout is not None and not self.process.stdout.closed:
-                self.process.stdout.close()
-            self.process.wait()
+            self.close_stdout()
+
+    def abort(self):
+        self.close_stdin()
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        self.close_stdout()
 
 
-def read_event_line(transport):
+def make_deadline(timeout):
+    if timeout is None:
+        return None
+    return time.monotonic() + timeout
+
+
+def remaining_seconds(deadline):
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def wait_for_readable(transport, deadline, description):
+    remaining = remaining_seconds(deadline)
+    if remaining is not None and remaining <= 0:
+        raise RequestTimeout(f"timed out waiting for {description}")
+    readable, _, _ = select.select([transport.fileno()], [], [], remaining)
+    if not readable:
+        raise RequestTimeout(f"timed out waiting for {description}")
+
+
+def read_event_line(transport, deadline=None, description="event"):
+    wait_for_readable(transport, deadline, description)
     line = transport.readline()
     if not line:
         raise RuntimeError("unexpected EOF from host control transport")
@@ -106,21 +168,22 @@ def read_event_line(transport):
         raise RuntimeError("received invalid JSON event") from exc
 
 
-def run_request(transport, request_id, op, command=None):
+def run_request(transport, request_id, op, command=None, timeout=None):
+    deadline = make_deadline(timeout)
     transport.writeline(encode_request(request_id, op, command))
     while True:
-        event = read_event_line(transport)
+        event = read_event_line(transport, deadline, f"{op} request {request_id}")
         if event_completes_request(event, request_id, op):
             return 0
 
 
-def run_one_shot(transport, op, command=None):
-    read_event_line(transport)
-    return run_request(transport, 1, op, command)
+def run_one_shot(transport, op, command=None, timeout=None):
+    read_event_line(transport, make_deadline(timeout), "ready event")
+    return run_request(transport, 1, op, command, timeout)
 
 
-def run_repl(transport):
-    read_event_line(transport)
+def run_repl(transport, timeout=None):
+    read_event_line(transport, make_deadline(timeout), "ready event")
     next_request_id = 1
 
     while True:
@@ -148,12 +211,18 @@ def run_repl(transport):
             sys.stderr.flush()
             continue
 
-        run_request(transport, next_request_id, op, command)
+        run_request(transport, next_request_id, op, command, timeout)
         next_request_id += 1
 
 
 def parse_args(argv):
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="seconds to wait for each host-control response",
+    )
     subparsers = parser.add_subparsers(dest="transport", required=True)
 
     socket_parser = subparsers.add_parser("socket")
@@ -167,6 +236,9 @@ def parse_args(argv):
     stdio_parser.add_argument("spawn_command", nargs=argparse.REMAINDER)
 
     args = parser.parse_args(argv)
+
+    if args.timeout is not None and args.timeout <= 0:
+        parser.error("timeout must be greater than zero")
 
     if args.transport == "stdio":
         if args.action != "exec" and args.command is not None:
@@ -202,15 +274,22 @@ def main(argv=None):
         print(str(exc), file=sys.stderr)
         return 1
 
+    aborted = False
     try:
         if args.action == "repl":
-            return run_repl(transport)
-        return run_one_shot(transport, args.action, args.command)
+            return run_repl(transport, args.timeout)
+        return run_one_shot(transport, args.action, args.command, args.timeout)
+    except RequestTimeout as exc:
+        print(str(exc), file=sys.stderr)
+        transport.abort()
+        aborted = True
+        return 1
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
     finally:
-        transport.close()
+        if not aborted:
+            transport.close()
 
 
 if __name__ == "__main__":
