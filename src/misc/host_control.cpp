@@ -29,12 +29,18 @@ constexpr std::size_t buffered_output_max_bytes = 4096;
 constexpr uint64_t buffered_output_max_ms = 100;
 constexpr std::size_t input_queue_max_codes = 1024;
 
+struct PendingInputCode {
+	uint64_t sequence = 0;
+	uint16_t code = 0;
+};
+
 bool session_active = false;
 bool session_write_failed = false;
 std::string active_request_id = {};
 BufferedOutput buffered_output = {};
 WriteLineFn active_write_line = {};
-std::deque<uint16_t> pending_input_codes = {};
+std::deque<PendingInputCode> pending_input_codes = {};
+uint64_t next_pending_input_sequence = 0;
 std::mutex pending_input_mutex = {};
 
 uint64_t get_monotonic_ms()
@@ -522,7 +528,7 @@ InputQueueResult queue_input_codes(const std::vector<uint16_t> &codes)
 	}
 
 	for (const auto code : codes) {
-		pending_input_codes.push_back(code);
+		pending_input_codes.push_back({next_pending_input_sequence++, code});
 	}
 
 	result.ok = true;
@@ -541,13 +547,15 @@ std::size_t drain_queued_input()
 	std::size_t drained = 0;
 
 	for (;;) {
+		uint64_t sequence = 0;
 		uint16_t code = 0;
 		{
 			std::lock_guard<std::mutex> lock(pending_input_mutex);
 			if (pending_input_codes.empty()) {
 				return drained;
 			}
-			code = pending_input_codes.front();
+			sequence = pending_input_codes.front().sequence;
+			code = pending_input_codes.front().code;
 		}
 
 		if (!BIOS_AddKeyToBuffer(code)) {
@@ -556,7 +564,7 @@ std::size_t drain_queued_input()
 
 		{
 			std::lock_guard<std::mutex> lock(pending_input_mutex);
-			if (!pending_input_codes.empty() && pending_input_codes.front() == code) {
+			if (!pending_input_codes.empty() && pending_input_codes.front().sequence == sequence) {
 				pending_input_codes.pop_front();
 			}
 		}
@@ -569,7 +577,7 @@ std::size_t drain_queued_input_codes_for_test(std::vector<uint16_t> &codes, cons
 	std::lock_guard<std::mutex> lock(pending_input_mutex);
 	std::size_t drained = 0;
 	while (drained < max_codes && !pending_input_codes.empty()) {
-		codes.push_back(pending_input_codes.front());
+		codes.push_back(pending_input_codes.front().code);
 		pending_input_codes.pop_front();
 		++drained;
 	}
