@@ -25,6 +25,8 @@ struct Request {
 	std::string id = {};
 	std::string op = {};
 	std::string command = {};
+	std::string text = {};
+	std::string key = {};
 	std::string error = {};
 };
 
@@ -119,6 +121,7 @@ std::string make_exec_result_json_line(const std::string &id,
                                        bool ok,
                                        const CommandResult &result);
 std::string make_status_json_line(const std::string &id, const StatusSnapshot &snapshot);
+std::string make_input_result_json_line(const std::string &id, bool ok, std::size_t queued);
 void reset_buffered_output(BufferedOutput &buffer, const std::string &request_id);
 void append_buffered_output(BufferedOutput &buffer, const uint8_t *data, std::size_t size, uint64_t now_ms);
 bool has_buffered_output(const BufferedOutput &buffer);

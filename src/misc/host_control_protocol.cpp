@@ -182,7 +182,8 @@ Request parse_request_line(const std::string &line)
 	}
 
 	request.op = op_it->second;
-	if (request.op != "exec" && request.op != "status") {
+	if (request.op != "exec" && request.op != "status" &&
+	    request.op != "input_text" && request.op != "key") {
 		request.error = "unsupported op";
 		return request;
 	}
@@ -195,6 +196,26 @@ Request parse_request_line(const std::string &line)
 		}
 
 		request.command = command_it->second;
+	}
+
+	if (request.op == "input_text") {
+		const auto text_it = values.find("text");
+		if (text_it == values.end()) {
+			request.error = "missing text";
+			return request;
+		}
+
+		request.text = text_it->second;
+	}
+
+	if (request.op == "key") {
+		const auto key_it = values.find("key");
+		if (key_it == values.end() || key_it->second.empty()) {
+			request.error = "missing key";
+			return request;
+		}
+
+		request.key = key_it->second;
 	}
 
 	request.ok = true;
@@ -274,6 +295,20 @@ std::string make_status_json_line(const std::string &id, const StatusSnapshot &s
 	json += "\",\"cwd\":\"";
 	json += json_escape(snapshot.cwd);
 	json += "\"}\n";
+	return json;
+}
+
+std::string make_input_result_json_line(const std::string &id,
+                                        const bool ok,
+                                        const std::size_t queued)
+{
+	std::string json = "{\"event\":\"input_result\",\"id\":\"";
+	json += json_escape(id);
+	json += "\",\"ok\":";
+	json += ok ? "true" : "false";
+	json += ",\"queued\":";
+	json += std::to_string(queued);
+	json += "}\n";
 	return json;
 }
 

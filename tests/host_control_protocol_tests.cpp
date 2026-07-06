@@ -140,6 +140,46 @@ TEST(HostControlProtocolTest, ParsesExecRequest)
 	EXPECT_TRUE(request.error.empty());
 }
 
+TEST(HostControlProtocolTest, ParsesInputTextRequest)
+{
+	const auto request = host_control::parse_request_line(R"({"id":"7","op":"input_text","text":"dir\r"})");
+
+	EXPECT_TRUE(request.ok);
+	EXPECT_EQ(request.id, "7");
+	EXPECT_EQ(request.op, "input_text");
+	EXPECT_EQ(request.text, "dir\r");
+	EXPECT_TRUE(request.error.empty());
+}
+
+TEST(HostControlProtocolTest, RejectsInputTextWithoutText)
+{
+	const auto request = host_control::parse_request_line(R"({"id":"7","op":"input_text"})");
+
+	EXPECT_FALSE(request.ok);
+	EXPECT_EQ(request.id, "7");
+	EXPECT_EQ(request.error, "missing text");
+}
+
+TEST(HostControlProtocolTest, ParsesKeyRequest)
+{
+	const auto request = host_control::parse_request_line(R"({"id":"8","op":"key","key":"enter"})");
+
+	EXPECT_TRUE(request.ok);
+	EXPECT_EQ(request.id, "8");
+	EXPECT_EQ(request.op, "key");
+	EXPECT_EQ(request.key, "enter");
+	EXPECT_TRUE(request.error.empty());
+}
+
+TEST(HostControlProtocolTest, RejectsKeyWithoutKeyName)
+{
+	const auto request = host_control::parse_request_line(R"({"id":"8","op":"key"})");
+
+	EXPECT_FALSE(request.ok);
+	EXPECT_EQ(request.id, "8");
+	EXPECT_EQ(request.error, "missing key");
+}
+
 TEST(HostControlProtocolTest, ParsesStatusRequestWithoutCommand)
 {
 	const auto request = host_control::parse_request_line(R"({"id":"42","op":"status"})");
@@ -158,6 +198,12 @@ TEST(HostControlProtocolTest, RejectsUnsupportedOperation)
 	EXPECT_FALSE(request.ok);
 	EXPECT_EQ(request.id, "42");
 	EXPECT_EQ(request.error, "unsupported op");
+}
+
+TEST(HostControlProtocolTest, InputResultReportsQueuedCount)
+{
+	EXPECT_EQ(host_control::make_input_result_json_line("9", true, 4),
+	          "{\"event\":\"input_result\",\"id\":\"9\",\"ok\":true,\"queued\":4}\n");
 }
 
 TEST(HostControlProtocolTest, StatusLineReportsSessionState)
