@@ -16,6 +16,8 @@
 #include <unistd.h>
 #endif
 
+#include "dosbox.h"
+#include "bios.h"
 #include "control.h"
 #include "dos_inc.h"
 #include "shell.h"
@@ -536,7 +538,30 @@ void clear_queued_input()
 
 std::size_t drain_queued_input()
 {
-	return 0;
+	std::size_t drained = 0;
+
+	for (;;) {
+		uint16_t code = 0;
+		{
+			std::lock_guard<std::mutex> lock(pending_input_mutex);
+			if (pending_input_codes.empty()) {
+				return drained;
+			}
+			code = pending_input_codes.front();
+		}
+
+		if (!BIOS_AddKeyToBuffer(code)) {
+			return drained;
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(pending_input_mutex);
+			if (!pending_input_codes.empty() && pending_input_codes.front() == code) {
+				pending_input_codes.pop_front();
+			}
+		}
+		++drained;
+	}
 }
 
 std::size_t drain_queued_input_codes_for_test(std::vector<uint16_t> &codes, const std::size_t max_codes)
