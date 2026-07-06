@@ -237,6 +237,14 @@ SessionResult run_control_session(const Options &options,
 			continue;
 		}
 
+		if (request.op != "exec") {
+			if (!emit_session_line(make_error_json_line(request.id, "unsupported op"))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
 		CommandResult command_result = {};
 		active_request_id = request.id;
 		reset_buffered_output(buffered_output, request.id);

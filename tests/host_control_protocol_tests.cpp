@@ -180,6 +180,15 @@ TEST(HostControlProtocolTest, RejectsKeyWithoutKeyName)
 	EXPECT_EQ(request.error, "missing key");
 }
 
+TEST(HostControlProtocolTest, RejectsKeyWithEmptyKeyName)
+{
+	const auto request = host_control::parse_request_line(R"({"id":"8","op":"key","key":""})");
+
+	EXPECT_FALSE(request.ok);
+	EXPECT_EQ(request.id, "8");
+	EXPECT_EQ(request.error, "missing key");
+}
+
 TEST(HostControlProtocolTest, ParsesStatusRequestWithoutCommand)
 {
 	const auto request = host_control::parse_request_line(R"({"id":"42","op":"status"})");
@@ -390,6 +399,48 @@ TEST(HostControlProtocolTest, SessionRunnerEmitsReadyAndInvalidRequestError)
 	EXPECT_EQ(writes[0],
 	          "{\"event\":\"ready\",\"transport\":\"socket\",\"endpoint\":\"/tmp/dosboxx.sock\"}\n");
 	EXPECT_EQ(writes[1], "{\"event\":\"error\",\"id\":\"42\",\"message\":\"unsupported op\"}\n");
+}
+
+TEST(HostControlProtocolTest, SessionRunnerRejectsInputTextBeforeExec)
+{
+	std::vector<std::string> writes = {};
+	std::vector<std::string> requests = {R"({"id":"7","op":"input_text","text":"dir\r"})"};
+	std::size_t next_request = 0;
+	bool exec_called = false;
+
+	const auto read_line = [&](std::string &line) {
+		if (next_request >= requests.size()) {
+			line.clear();
+			return false;
+		}
+
+		line = requests[next_request++];
+		return true;
+	};
+	const auto write_line = [&](const std::string &line) {
+		writes.push_back(line);
+		return true;
+	};
+	const auto exec_request = [&](const host_control::Request &request,
+	                              host_control::CommandResult &) {
+		exec_called = true;
+		EXPECT_EQ(request.op, "input_text");
+		return false;
+	};
+
+	const auto result = host_control::run_control_session(
+	        host_control::Options{host_control::Transport::Socket, "/tmp/d.sock"},
+	        read_line,
+	        write_line,
+	        exec_request);
+
+	EXPECT_TRUE(result.started);
+	EXPECT_FALSE(result.had_io_error);
+	EXPECT_FALSE(exec_called);
+	ASSERT_EQ(writes.size(), 2u);
+	EXPECT_EQ(writes[0],
+	          "{\"event\":\"ready\",\"transport\":\"socket\",\"endpoint\":\"/tmp/d.sock\"}\n");
+	EXPECT_EQ(writes[1], "{\"event\":\"error\",\"id\":\"7\",\"message\":\"unsupported op\"}\n");
 }
 
 TEST(HostControlProtocolTest, SessionRunnerEmitsStatusWithoutResult)
