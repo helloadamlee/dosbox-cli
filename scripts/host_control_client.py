@@ -166,11 +166,20 @@ def wait_for_workflow_event(transport, matcher, timeout=None, recorder=None):
 
 
 def validate_workflow_for_transport(steps, allow_input):
-    if allow_input:
-        return
+    validate_workflow_steps_for_transport(steps, allow_input)
+
+
+def validate_workflow_steps_for_transport(steps, allow_input, prefix="step"):
     for index, step in enumerate(steps):
-        if step.action in ("input_text", "key"):
-            raise WorkflowError(f"step {index}: {step.action} actions are socket-only")
+        step_name = f"{prefix} {index}" if prefix == "step" else f"{prefix}.{index}"
+        if not allow_input and step.action in ("input_text", "key", "exec_interactive"):
+            raise WorkflowError(f"{step_name}: {step.action} actions are socket-only")
+        if step.action == "exec_interactive":
+            validate_workflow_steps_for_transport(
+                step.value["steps"],
+                allow_input,
+                prefix=f"{step_name}",
+            )
 
 
 def encode_request(request_id, op, command=None, text=None, key=None):

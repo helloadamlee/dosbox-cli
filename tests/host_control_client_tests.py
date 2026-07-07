@@ -610,6 +610,44 @@ class HostControlClientTest(unittest.TestCase):
             self.assertIn("input_text actions are socket-only", proc.stderr)
             self.assertNotIn("should not spawn", proc.stderr)
 
+    def test_stdio_workflow_rejects_interactive_exec_before_spawn(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            recipe_path = self._write_recipe(
+                tmpdir,
+                {
+                    "steps": [
+                        {
+                            "exec_interactive": {
+                                "command": "pause",
+                                "steps": [{"key": "enter"}],
+                            }
+                        }
+                    ]
+                },
+            )
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLIENT),
+                    "stdio",
+                    "workflow",
+                    str(recipe_path),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "raise SystemExit('should not spawn')",
+                    "-control-stdio",
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("exec_interactive actions are socket-only", proc.stderr)
+            self.assertNotIn("should not spawn", proc.stderr)
+
     def test_socket_workflow_writes_jsonl_transcript_without_changing_stdout(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             sock_path = str(Path(tmpdir) / "control.sock")
