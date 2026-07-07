@@ -1,10 +1,17 @@
 #include "host_control.h"
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <map>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/socket.h>
@@ -12,6 +19,8 @@
 #include <unistd.h>
 #endif
 
+#include "dosbox.h"
+#include "bios.h"
 #include "control.h"
 #include "dos_inc.h"
 #include "shell.h"
@@ -21,12 +30,21 @@ namespace {
 
 constexpr std::size_t buffered_output_max_bytes = 4096;
 constexpr uint64_t buffered_output_max_ms = 100;
+constexpr std::size_t input_queue_max_codes = 1024;
+
+struct PendingInputCode {
+	uint64_t sequence = 0;
+	uint16_t code = 0;
+};
 
 bool session_active = false;
-bool session_write_failed = false;
+std::atomic<bool> session_write_failed = {false};
 std::string active_request_id = {};
 BufferedOutput buffered_output = {};
 WriteLineFn active_write_line = {};
+std::deque<PendingInputCode> pending_input_codes = {};
+uint64_t next_pending_input_sequence = 0;
+std::mutex pending_input_mutex = {};
 
 uint64_t get_monotonic_ms()
 {
@@ -52,6 +70,17 @@ void populate_command_result(CommandResult &result)
 	result.cwd = get_current_dos_path();
 }
 
+StatusSnapshot snapshot_status(const Options &options)
+{
+	StatusSnapshot status = {};
+	status.transport = options.transport;
+	status.session_active = session_active;
+	status.errorlevel = dos.return_code;
+	status.drive.assign(1, static_cast<char>('A' + DOS_GetDefaultDrive()));
+	status.cwd = get_current_dos_path();
+	return status;
+}
+
 bool emit_session_line(const std::string &line)
 {
 	if (line.empty()) {
@@ -59,43 +88,16 @@ bool emit_session_line(const std::string &line)
 	}
 
 	if (!active_write_line) {
-		session_write_failed = true;
+		session_write_failed.store(true);
 		return false;
 	}
 
 	if (!active_write_line(line)) {
-		session_write_failed = true;
+		session_write_failed.store(true);
 		return false;
 	}
 
 	return true;
-}
-
-bool read_stdin_line(std::string &line)
-{
-	line.clear();
-
-	char buffer[4096] = {};
-	if (std::fgets(buffer, sizeof(buffer), stdin) == nullptr) {
-		return false;
-	}
-
-	line.assign(buffer);
-	while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
-		line.pop_back();
-	}
-
-	return true;
-}
-
-bool write_stdout_line(const std::string &line)
-{
-	if (line.empty()) {
-		return true;
-	}
-
-	return std::fwrite(line.data(), 1, line.size(), stdout) == line.size() &&
-	       std::fflush(stdout) == 0;
 }
 
 void reset_session_state()
@@ -103,7 +105,7 @@ void reset_session_state()
 	reset_buffered_output(buffered_output, {});
 	active_request_id.clear();
 	active_write_line = {};
-	session_write_failed = false;
+	session_write_failed.store(false);
 	session_active = false;
 }
 
@@ -176,6 +178,157 @@ void close_fd(int &fd)
 		fd = -1;
 	}
 }
+
+struct SocketSessionState {
+	int client_fd = -1;
+	std::mutex mutex = {};
+	std::condition_variable condition = {};
+	std::deque<Request> requests = {};
+	bool disconnected = false;
+	bool had_io_error = false;
+};
+
+bool write_socket_session_line(SocketSessionState &state, const std::string &line)
+{
+	if (line.empty()) {
+		return true;
+	}
+
+	std::lock_guard<std::mutex> lock(state.mutex);
+	if (!write_fd_line(state.client_fd, line)) {
+		state.had_io_error = true;
+		state.disconnected = true;
+		session_write_failed.store(true);
+		state.condition.notify_all();
+		return false;
+	}
+
+	return true;
+}
+
+void handle_socket_input_request(SocketSessionState &state, const Request &request)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+	const bool built = request.op == "input_text"
+	                         ? build_input_codes_for_text(request.text, codes, error)
+	                         : build_input_codes_for_key(request.key, codes, error);
+	if (!built) {
+		(void)write_socket_session_line(state, make_error_json_line(request.id, error));
+		return;
+	}
+
+	const auto queued = queue_input_codes(codes);
+	if (!queued.ok) {
+		(void)write_socket_session_line(state, make_error_json_line(request.id, queued.error));
+		return;
+	}
+
+	(void)write_socket_session_line(
+	        state, make_input_result_json_line(request.id, true, queued.queued));
+}
+
+void socket_session_reader(SocketSessionState &state)
+{
+	for (;;) {
+		std::string line = {};
+		if (!read_fd_line(state.client_fd, line)) {
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.disconnected = true;
+			state.condition.notify_all();
+			return;
+		}
+		if (line.empty()) {
+			continue;
+		}
+
+		const auto request = parse_request_line(line);
+		if (!request.ok) {
+			(void)write_socket_session_line(
+			        state, make_error_json_line(request.id, request.error));
+			continue;
+		}
+
+		if (request.op == "input_text" || request.op == "key") {
+			handle_socket_input_request(state, request);
+			continue;
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.requests.push_back(request);
+		}
+		state.condition.notify_all();
+	}
+}
+
+bool is_socket_session_disconnected(SocketSessionState &state)
+{
+	std::lock_guard<std::mutex> lock(state.mutex);
+	return state.disconnected;
+}
+
+bool mark_socket_session_disconnected(SocketSessionState &state, const bool had_io_error)
+{
+	std::lock_guard<std::mutex> lock(state.mutex);
+	state.disconnected = true;
+	state.had_io_error = state.had_io_error || had_io_error;
+	state.condition.notify_all();
+	return true;
+}
+
+bool is_socket_would_block_error(const int error)
+{
+#if EAGAIN == EWOULDBLOCK
+	return error == EAGAIN;
+#else
+	return error == EAGAIN || error == EWOULDBLOCK;
+#endif
+}
+
+bool has_socket_session_peer_disconnected(SocketSessionState &state)
+{
+	char byte = 0;
+	const auto received = recv(state.client_fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+	if (received == 0) {
+		return mark_socket_session_disconnected(state, false);
+	}
+	if (received > 0) {
+		return false;
+	}
+	if (is_socket_would_block_error(errno) || errno == EINTR) {
+		return is_socket_session_disconnected(state);
+	}
+
+	return mark_socket_session_disconnected(state, true);
+}
+#else
+bool read_stdin_line(std::string &line)
+{
+	line.clear();
+
+	char buffer[4096] = {};
+	if (std::fgets(buffer, sizeof(buffer), stdin) == nullptr) {
+		return false;
+	}
+
+	line.assign(buffer);
+	while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+		line.pop_back();
+	}
+
+	return true;
+}
+
+bool write_stdout_line(const std::string &line)
+{
+	if (line.empty()) {
+		return true;
+	}
+
+	return std::fwrite(line.data(), 1, line.size(), stdout) == line.size() &&
+	       std::fflush(stdout) == 0;
+}
 #endif
 
 } // namespace
@@ -189,7 +342,7 @@ SessionResult run_control_session(const Options &options,
 	active_write_line = write_line;
 	active_request_id.clear();
 	reset_buffered_output(buffered_output, {});
-	session_write_failed = false;
+	session_write_failed.store(false);
 	session_active = true;
 
 	if (!emit_session_line(make_ready_json_line(options))) {
@@ -218,6 +371,52 @@ SessionResult run_control_session(const Options &options,
 			continue;
 		}
 
+		if (request.op == "status") {
+			if (!emit_session_line(make_status_json_line(request.id, snapshot_status(options)))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
+		if (request.op == "input_text" || request.op == "key") {
+			std::vector<uint16_t> codes = {};
+			std::string error = {};
+			const bool built = request.op == "input_text"
+			                         ? build_input_codes_for_text(request.text, codes, error)
+			                         : build_input_codes_for_key(request.key, codes, error);
+			if (!built) {
+				if (!emit_session_line(make_error_json_line(request.id, error))) {
+					result.had_io_error = true;
+					break;
+				}
+				continue;
+			}
+
+			const auto queued = queue_input_codes(codes);
+			if (!queued.ok) {
+				if (!emit_session_line(make_error_json_line(request.id, queued.error))) {
+					result.had_io_error = true;
+					break;
+				}
+				continue;
+			}
+
+			if (!emit_session_line(make_input_result_json_line(request.id, true, queued.queued))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
+		if (request.op != "exec") {
+			if (!emit_session_line(make_error_json_line(request.id, "unsupported op"))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
 		CommandResult command_result = {};
 		active_request_id = request.id;
 		reset_buffered_output(buffered_output, request.id);
@@ -225,7 +424,7 @@ SessionResult run_control_session(const Options &options,
 		const bool ok = exec_request(request, command_result);
 		const auto end_ms = get_monotonic_ms();
 		command_result.duration_ms = end_ms >= start_ms ? (end_ms - start_ms) : 0;
-		if (session_write_failed ||
+		if (session_write_failed.load() ||
 		    !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
 			result.had_io_error = true;
 			active_request_id.clear();
@@ -250,12 +449,158 @@ SessionResult run_control_session(const Options &options,
 	return result;
 }
 
+SessionResult run_control_socket_session(const Options &options,
+                                         int client_fd,
+                                         const ExecRequestFn &exec_request)
+{
+	SessionResult result = {};
+
+#if !defined(__unix__) && !defined(__APPLE__)
+	(void)options;
+	(void)client_fd;
+	(void)exec_request;
+	result.had_io_error = true;
+	return result;
+#else
+	SocketSessionState state = {};
+	state.client_fd = client_fd;
+
+	active_write_line = [&state](const std::string &line) {
+		return write_socket_session_line(state, line);
+	};
+	active_request_id.clear();
+	reset_buffered_output(buffered_output, {});
+	session_write_failed.store(false);
+	session_active = true;
+
+	if (!emit_session_line(make_ready_json_line(options))) {
+		result.had_io_error = true;
+		close_fd(state.client_fd);
+		reset_session_state();
+		return result;
+	}
+
+	result.started = true;
+	std::thread reader(socket_session_reader, std::ref(state));
+
+	for (;;) {
+		Request request = {};
+		{
+			std::unique_lock<std::mutex> lock(state.mutex);
+			state.condition.wait(lock, [&state]() {
+				return !state.requests.empty() || state.disconnected;
+			});
+			if (state.disconnected) {
+				break;
+			}
+			if (!state.requests.empty()) {
+				request = state.requests.front();
+				state.requests.pop_front();
+			}
+		}
+
+		if (has_socket_session_peer_disconnected(state)) {
+			break;
+		}
+
+		if (request.op == "status") {
+			if (!emit_session_line(make_status_json_line(request.id, snapshot_status(options)))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
+		if (request.op != "exec") {
+			if (!emit_session_line(make_error_json_line(request.id, "unsupported op"))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
+		CommandResult command_result = {};
+		active_request_id = request.id;
+		reset_buffered_output(buffered_output, request.id);
+		const auto start_ms = get_monotonic_ms();
+		const bool ok = exec_request(request, command_result);
+		const auto end_ms = get_monotonic_ms();
+		command_result.duration_ms = end_ms >= start_ms ? (end_ms - start_ms) : 0;
+		if (has_socket_session_peer_disconnected(state)) {
+			active_request_id.clear();
+			break;
+		}
+		if (session_write_failed.load() ||
+		    !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
+			result.had_io_error = true;
+			active_request_id.clear();
+			break;
+		}
+		active_request_id.clear();
+
+		if (!emit_session_line(make_exec_result_json_line(request.id, ok, command_result))) {
+			result.had_io_error = true;
+			break;
+		}
+		if (command_result.shell_exit) {
+			break;
+		}
+	}
+
+	if (!result.had_io_error && !has_socket_session_peer_disconnected(state) &&
+	    !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
+		result.had_io_error = true;
+	}
+
+	(void)shutdown(state.client_fd, SHUT_RDWR);
+	if (reader.joinable()) {
+		reader.join();
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(state.mutex);
+		result.had_io_error = result.had_io_error || state.had_io_error;
+	}
+
+	close_fd(state.client_fd);
+	reset_session_state();
+	return result;
+#endif
+}
+
 bool run_stdio_shell()
 {
 	if (control == nullptr || !is_stdio_enabled(control->opt_host_control)) {
 		return false;
 	}
 
+#if defined(__unix__) || defined(__APPLE__)
+	int stdin_fd = dup(STDIN_FILENO);
+	int stdout_fd = dup(STDOUT_FILENO);
+	if (stdin_fd < 0 || stdout_fd < 0) {
+		std::fprintf(stderr, "%s\n", std::strerror(errno));
+		std::fflush(stderr);
+		close_fd(stdin_fd);
+		close_fd(stdout_fd);
+		return false;
+	}
+
+	const auto result = run_control_session(
+	        control->opt_host_control,
+	        [stdin_fd](std::string &line) { return read_fd_line(stdin_fd, line); },
+	        [stdout_fd](const std::string &line) { return write_fd_line(stdout_fd, line); },
+	        [](const Request &request, CommandResult &result) {
+		        const bool ok = SHELL_ExecuteHostCommand(request.command, result.shell_exit);
+		        if (ok) {
+			        populate_command_result(result);
+		        }
+		        return ok;
+	        });
+
+	close_fd(stdin_fd);
+	close_fd(stdout_fd);
+	return result.started;
+#else
 	const auto result = run_control_session(
 	        control->opt_host_control,
 	        read_stdin_line,
@@ -268,6 +613,18 @@ bool run_stdio_shell()
 		        return ok;
 	        });
 	return result.started;
+#endif
+}
+
+bool run_pipe_shell()
+{
+	if (control == nullptr || !is_pipe_enabled(control->opt_host_control)) {
+		return false;
+	}
+
+	std::fprintf(stderr, "Host control pipe transport is not implemented\n");
+	std::fflush(stderr);
+	return false;
 }
 
 bool open_socket_server(const std::string &path, SocketServer &server, std::string &error)
@@ -366,10 +723,9 @@ bool run_socket_shell()
 		return false;
 	}
 
-	const auto result = run_control_session(
+	const auto result = run_control_socket_session(
 	        control->opt_host_control,
-	        [client_fd](std::string &line) { return read_fd_line(client_fd, line); },
-	        [client_fd](const std::string &line) { return write_fd_line(client_fd, line); },
+	        client_fd,
 	        [](const Request &request, CommandResult &result) {
 		        const bool ok = SHELL_ExecuteHostCommand(request.command, result.shell_exit);
 		        if (ok) {
@@ -378,10 +734,128 @@ bool run_socket_shell()
 		        return ok;
 	        });
 
-	close_fd(client_fd);
 	close_socket_server(server);
 	return result.started;
 #endif
+}
+
+bool build_input_codes_for_text(const std::string &text,
+                                std::vector<uint16_t> &codes,
+                                std::string &error)
+{
+	codes.clear();
+	error.clear();
+
+	for (const auto ch : text) {
+		const auto byte = static_cast<unsigned char>(ch);
+		if (byte == '\r' || byte == '\n') {
+			codes.push_back(0x1c0d);
+			continue;
+		}
+		if (byte < 0x20 || byte > 0x7e) {
+			error = "input_text supports ASCII only";
+			codes.clear();
+			return false;
+		}
+		codes.push_back(static_cast<uint16_t>(byte));
+	}
+
+	return true;
+}
+
+bool build_input_codes_for_key(const std::string &key,
+                               std::vector<uint16_t> &codes,
+                               std::string &error)
+{
+	static const std::map<std::string, uint16_t> named_keys = {
+	        {"enter", 0x1c0d},
+	        {"escape", 0x011b},
+	        {"tab", 0x0f09},
+	        {"backspace", 0x0e08},
+	        {"up", 0x4800},
+	        {"down", 0x5000},
+	        {"left", 0x4b00},
+	        {"right", 0x4d00},
+	};
+
+	codes.clear();
+	error.clear();
+
+	const auto it = named_keys.find(key);
+	if (it == named_keys.end()) {
+		error = "unsupported key";
+		return false;
+	}
+
+	codes.push_back(it->second);
+	return true;
+}
+
+InputQueueResult queue_input_codes(const std::vector<uint16_t> &codes)
+{
+	InputQueueResult result = {};
+	std::lock_guard<std::mutex> lock(pending_input_mutex);
+
+	if (pending_input_codes.size() + codes.size() > input_queue_max_codes) {
+		result.error = "input queue full";
+		return result;
+	}
+
+	for (const auto code : codes) {
+		pending_input_codes.push_back({next_pending_input_sequence++, code});
+	}
+
+	result.ok = true;
+	result.queued = codes.size();
+	return result;
+}
+
+void clear_queued_input()
+{
+	std::lock_guard<std::mutex> lock(pending_input_mutex);
+	pending_input_codes.clear();
+}
+
+std::size_t drain_queued_input()
+{
+	std::size_t drained = 0;
+
+	for (;;) {
+		uint64_t sequence = 0;
+		uint16_t code = 0;
+		{
+			std::lock_guard<std::mutex> lock(pending_input_mutex);
+			if (pending_input_codes.empty()) {
+				return drained;
+			}
+			sequence = pending_input_codes.front().sequence;
+			code = pending_input_codes.front().code;
+		}
+
+		if (!BIOS_AddKeyToBuffer(code)) {
+			return drained;
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(pending_input_mutex);
+			if (!pending_input_codes.empty() && pending_input_codes.front().sequence == sequence) {
+				pending_input_codes.pop_front();
+			}
+		}
+		++drained;
+	}
+}
+
+std::size_t drain_queued_input_codes_for_test(std::vector<uint16_t> &codes, const std::size_t max_codes)
+{
+	std::lock_guard<std::mutex> lock(pending_input_mutex);
+	std::size_t drained = 0;
+	while (drained < max_codes && !pending_input_codes.empty()) {
+		codes.push_back(pending_input_codes.front().code);
+		pending_input_codes.pop_front();
+		++drained;
+	}
+	return drained;
 }
 
 void capture_dos_write(const uint16_t info, const char *name, const uint8_t *data, const std::size_t size)

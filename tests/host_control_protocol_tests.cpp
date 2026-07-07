@@ -1,17 +1,22 @@
 #include "dosbox.h"
+#include "dos_inc.h"
 #include "host_control.h"
 
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstring>
 #include <cstdio>
+#include <future>
 #include <thread>
 #include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
+#include <sys/socket.h>
 #include <unistd.h>
 #endif
 
+#include "../src/dos/drives.h"
 #include "dosbox_test_fixture.h"
 
 bool DOSBOX_parse_argv();
@@ -26,7 +31,67 @@ std::string make_temp_socket_path()
 	EXPECT_NE(dir, nullptr);
 	return std::string(dir ? dir : "/tmp") + "/control.sock";
 }
+
+class SocketSessionTestCleanup {
+public:
+	SocketSessionTestCleanup(std::promise<void> &finish_promise, int &client_fd, std::thread &thread)
+	        : allow_exec_finish(finish_promise),
+	          client_fd(client_fd),
+	          server(thread)
+	{}
+
+	~SocketSessionTestCleanup()
+	{
+		release_exec();
+		if (client_fd >= 0) {
+			(void)shutdown(client_fd, SHUT_RDWR);
+			(void)close(client_fd);
+			client_fd = -1;
+		}
+		if (server.joinable()) {
+			server.join();
+		}
+		host_control::clear_queued_input();
+	}
+
+	void release_exec()
+	{
+		if (!released) {
+			allow_exec_finish.set_value();
+			released = true;
+		}
+	}
+
+private:
+	std::promise<void> &allow_exec_finish;
+	int &client_fd;
+	std::thread &server;
+	bool released = false;
+};
 #endif
+
+class ScopedHostControlDosState {
+public:
+	ScopedHostControlDosState()
+	        : default_drive(DOS_GetDefaultDrive()),
+	          errorlevel(dos.return_code),
+	          z_drive_curdir(Drives[25] ? Drives[25]->curdir : "")
+	{}
+
+	~ScopedHostControlDosState()
+	{
+		dos.return_code = errorlevel;
+		if (Drives[25] != nullptr) {
+			std::strcpy(Drives[25]->curdir, z_drive_curdir.c_str());
+		}
+		DOS_SetDefaultDrive(default_drive);
+	}
+
+private:
+	uint8_t default_drive = 0;
+	uint16_t errorlevel = 0;
+	std::string z_drive_curdir = {};
+};
 
 class DOSBox_HostControlArgvTest : public DOSBoxTestFixture {
 protected:
@@ -80,6 +145,9 @@ TEST_F(DOSBox_HostControlArgvTest, ParsesControlPipePath)
 	ParseArgs("-control-pipe /tmp/dosboxx.pipe");
 	EXPECT_EQ(control->opt_host_control.transport, host_control::Transport::Pipe);
 	EXPECT_EQ(control->opt_host_control.endpoint, "/tmp/dosboxx.pipe");
+	EXPECT_TRUE(host_control::is_pipe_enabled(control->opt_host_control));
+	EXPECT_FALSE(host_control::is_stdio_enabled(control->opt_host_control));
+	EXPECT_FALSE(host_control::is_socket_enabled(control->opt_host_control));
 }
 
 TEST_F(DOSBox_HostControlArgvTest, ParsesHeadlessFlag)
@@ -111,6 +179,193 @@ TEST(HostControlProtocolTest, ParsesExecRequest)
 	EXPECT_TRUE(request.error.empty());
 }
 
+TEST(HostControlProtocolTest, ParsesInputTextRequest)
+{
+	const auto request = host_control::parse_request_line(R"({"id":"7","op":"input_text","text":"dir\r"})");
+
+	EXPECT_TRUE(request.ok);
+	EXPECT_EQ(request.id, "7");
+	EXPECT_EQ(request.op, "input_text");
+	EXPECT_EQ(request.text, "dir\r");
+	EXPECT_TRUE(request.error.empty());
+}
+
+TEST(HostControlProtocolTest, RejectsInputTextWithoutText)
+{
+	const auto request = host_control::parse_request_line(R"({"id":"7","op":"input_text"})");
+
+	EXPECT_FALSE(request.ok);
+	EXPECT_EQ(request.id, "7");
+	EXPECT_EQ(request.error, "missing text");
+}
+
+TEST(HostControlProtocolTest, ParsesKeyRequest)
+{
+	const auto request = host_control::parse_request_line(R"({"id":"8","op":"key","key":"enter"})");
+
+	EXPECT_TRUE(request.ok);
+	EXPECT_EQ(request.id, "8");
+	EXPECT_EQ(request.op, "key");
+	EXPECT_EQ(request.key, "enter");
+	EXPECT_TRUE(request.error.empty());
+}
+
+TEST(HostControlProtocolTest, RejectsKeyWithoutKeyName)
+{
+	const auto request = host_control::parse_request_line(R"({"id":"8","op":"key"})");
+
+	EXPECT_FALSE(request.ok);
+	EXPECT_EQ(request.id, "8");
+	EXPECT_EQ(request.error, "missing key");
+}
+
+TEST(HostControlProtocolTest, RejectsKeyWithEmptyKeyName)
+{
+	const auto request = host_control::parse_request_line(R"({"id":"8","op":"key","key":""})");
+
+	EXPECT_FALSE(request.ok);
+	EXPECT_EQ(request.id, "8");
+	EXPECT_EQ(request.error, "missing key");
+}
+
+TEST(HostControlProtocolTest, BuildsAsciiInputCodesForText)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+
+	EXPECT_TRUE(host_control::build_input_codes_for_text("dir\n", codes, error));
+	ASSERT_EQ(codes.size(), 4u);
+	EXPECT_EQ(codes[0], static_cast<uint16_t>('d'));
+	EXPECT_EQ(codes[1], static_cast<uint16_t>('i'));
+	EXPECT_EQ(codes[2], static_cast<uint16_t>('r'));
+	EXPECT_EQ(codes[3], 0x1c0d);
+	EXPECT_TRUE(error.empty());
+}
+
+TEST(HostControlProtocolTest, RejectsNonAsciiInputText)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+
+	EXPECT_FALSE(host_control::build_input_codes_for_text(std::string("\xC3\xA9", 2), codes, error));
+	EXPECT_TRUE(codes.empty());
+	EXPECT_EQ(error, "input_text supports ASCII only");
+}
+
+TEST(HostControlProtocolTest, BuildsEnterCodeForCarriageReturn)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+
+	EXPECT_TRUE(host_control::build_input_codes_for_text("\r", codes, error));
+	ASSERT_EQ(codes.size(), 1u);
+	EXPECT_EQ(codes[0], 0x1c0d);
+	EXPECT_TRUE(error.empty());
+}
+
+TEST(HostControlProtocolTest, RejectsControlByteInputText)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+
+	EXPECT_FALSE(host_control::build_input_codes_for_text(std::string("\x1b", 1), codes, error));
+	EXPECT_TRUE(codes.empty());
+	EXPECT_EQ(error, "input_text supports ASCII only");
+}
+
+TEST(HostControlProtocolTest, BuildsNamedKeyCodes)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+
+	const std::vector<std::pair<std::string, uint16_t>> expected_codes = {
+	        {"enter", 0x1c0d},
+	        {"escape", 0x011b},
+	        {"tab", 0x0f09},
+	        {"backspace", 0x0e08},
+	        {"up", 0x4800},
+	        {"down", 0x5000},
+	        {"left", 0x4b00},
+	        {"right", 0x4d00},
+	};
+
+	for (const auto &expected : expected_codes) {
+		EXPECT_TRUE(host_control::build_input_codes_for_key(expected.first, codes, error));
+		ASSERT_EQ(codes.size(), 1u);
+		EXPECT_EQ(codes[0], expected.second);
+		EXPECT_TRUE(error.empty());
+	}
+}
+
+TEST(HostControlProtocolTest, RejectsUnsupportedNamedKey)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+
+	EXPECT_FALSE(host_control::build_input_codes_for_key("f1", codes, error));
+	EXPECT_TRUE(codes.empty());
+	EXPECT_EQ(error, "unsupported key");
+}
+
+TEST(HostControlProtocolTest, InputQueueAcceptsAndDrainsCodesInOrder)
+{
+	host_control::clear_queued_input();
+
+	std::vector<uint16_t> codes = {static_cast<uint16_t>('d'), static_cast<uint16_t>('i')};
+	const auto queued = host_control::queue_input_codes(codes);
+
+	EXPECT_TRUE(queued.ok);
+	EXPECT_EQ(queued.queued, 2u);
+	EXPECT_TRUE(queued.error.empty());
+
+	std::vector<uint16_t> drained = {};
+	EXPECT_EQ(host_control::drain_queued_input_codes_for_test(drained, 8), 2u);
+	ASSERT_EQ(drained.size(), 2u);
+	EXPECT_EQ(drained[0], static_cast<uint16_t>('d'));
+	EXPECT_EQ(drained[1], static_cast<uint16_t>('i'));
+
+	host_control::clear_queued_input();
+}
+
+TEST(HostControlProtocolTest, InputQueueRejectsOverflowWithoutPartialAppend)
+{
+	host_control::clear_queued_input();
+
+	std::vector<uint16_t> codes(1024, static_cast<uint16_t>('x'));
+	const auto queued = host_control::queue_input_codes(codes);
+
+	EXPECT_TRUE(queued.ok);
+	EXPECT_EQ(queued.queued, 1024u);
+	EXPECT_TRUE(queued.error.empty());
+
+	std::vector<uint16_t> extra = {static_cast<uint16_t>('z')};
+	const auto overflow = host_control::queue_input_codes(extra);
+
+	EXPECT_FALSE(overflow.ok);
+	EXPECT_EQ(overflow.queued, 0u);
+	EXPECT_EQ(overflow.error, "input queue full");
+
+	std::vector<uint16_t> drained = {};
+	EXPECT_EQ(host_control::drain_queued_input_codes_for_test(drained, 1025), 1024u);
+	ASSERT_EQ(drained.size(), 1024u);
+	for (const auto code : drained) {
+		EXPECT_EQ(code, static_cast<uint16_t>('x'));
+	}
+
+	host_control::clear_queued_input();
+}
+
+TEST(HostControlProtocolTest, ParsesStatusRequestWithoutCommand)
+{
+	const auto request = host_control::parse_request_line(R"({"id":"42","op":"status"})");
+
+	EXPECT_TRUE(request.ok);
+	EXPECT_EQ(request.id, "42");
+	EXPECT_EQ(request.op, "status");
+	EXPECT_TRUE(request.command.empty());
+	EXPECT_TRUE(request.error.empty());
+}
+
 TEST(HostControlProtocolTest, RejectsUnsupportedOperation)
 {
 	const auto request = host_control::parse_request_line(R"({"id":"42","op":"shutdown"})");
@@ -118,6 +373,38 @@ TEST(HostControlProtocolTest, RejectsUnsupportedOperation)
 	EXPECT_FALSE(request.ok);
 	EXPECT_EQ(request.id, "42");
 	EXPECT_EQ(request.error, "unsupported op");
+}
+
+TEST(HostControlProtocolTest, InputResultReportsQueuedCount)
+{
+	EXPECT_EQ(host_control::make_input_result_json_line("9", true, 4),
+	          "{\"event\":\"input_result\",\"id\":\"9\",\"ok\":true,\"queued\":4}\n");
+}
+
+TEST(HostControlProtocolTest, StatusLineReportsSessionState)
+{
+	host_control::StatusSnapshot status = {};
+	status.transport = host_control::Transport::Socket;
+	status.session_active = true;
+	status.errorlevel = 7;
+	status.drive = "Z";
+	status.cwd = "Z:\\BUILD";
+
+	EXPECT_EQ(host_control::make_status_json_line("42", status),
+	          "{\"event\":\"status\",\"id\":\"42\",\"transport\":\"socket\",\"session_active\":true,\"errorlevel\":7,\"drive\":\"Z\",\"cwd\":\"Z:\\\\BUILD\"}\n");
+}
+
+TEST(HostControlProtocolTest, StatusLineEscapesPathFields)
+{
+	host_control::StatusSnapshot status = {};
+	status.transport = host_control::Transport::Stdio;
+	status.session_active = true;
+	status.errorlevel = 0;
+	status.drive = "C";
+	status.cwd = "C:\\TMP\\\"QUOTED\"";
+
+	EXPECT_EQ(host_control::make_status_json_line("77", status),
+	          "{\"event\":\"status\",\"id\":\"77\",\"transport\":\"stdio\",\"session_active\":true,\"errorlevel\":0,\"drive\":\"C\",\"cwd\":\"C:\\\\TMP\\\\\\\"QUOTED\\\"\"}\n");
 }
 
 TEST(HostControlProtocolTest, OutputLineEscapesPayload)
@@ -280,6 +567,250 @@ TEST(HostControlProtocolTest, SessionRunnerEmitsReadyAndInvalidRequestError)
 	EXPECT_EQ(writes[1], "{\"event\":\"error\",\"id\":\"42\",\"message\":\"unsupported op\"}\n");
 }
 
+TEST(HostControlProtocolTest, SessionRunnerQueuesInputText)
+{
+	host_control::clear_queued_input();
+	std::vector<std::string> writes = {};
+	std::vector<std::string> requests = {R"({"id":"7","op":"input_text","text":"dir\n"})"};
+	std::size_t next_request = 0;
+
+	const auto read_line = [&](std::string &line) {
+		if (next_request >= requests.size()) {
+			return false;
+		}
+		line = requests[next_request++];
+		return true;
+	};
+
+	const auto write_line = [&](const std::string &line) {
+		writes.push_back(line);
+		return true;
+	};
+
+	const auto result = host_control::run_control_session(
+	        {host_control::Transport::Socket, "/tmp/test.sock"},
+	        read_line,
+	        write_line,
+	        [](const host_control::Request &, host_control::CommandResult &) { return false; });
+
+	EXPECT_TRUE(result.started);
+	ASSERT_EQ(writes.size(), 2u);
+	EXPECT_EQ(writes[1], "{\"event\":\"input_result\",\"id\":\"7\",\"ok\":true,\"queued\":4}\n");
+
+	std::vector<uint16_t> drained = {};
+	EXPECT_EQ(host_control::drain_queued_input_codes_for_test(drained, 8), 4u);
+	host_control::clear_queued_input();
+}
+
+TEST(HostControlProtocolTest, SessionRunnerRejectsUnsupportedInputKey)
+{
+	std::vector<std::string> writes = {};
+	std::vector<std::string> requests = {R"({"id":"8","op":"key","key":"f1"})"};
+	std::size_t next_request = 0;
+
+	const auto read_line = [&](std::string &line) {
+		if (next_request >= requests.size()) {
+			return false;
+		}
+		line = requests[next_request++];
+		return true;
+	};
+
+	const auto write_line = [&](const std::string &line) {
+		writes.push_back(line);
+		return true;
+	};
+
+	(void)host_control::run_control_session(
+	        {host_control::Transport::Socket, "/tmp/test.sock"},
+	        read_line,
+	        write_line,
+	        [](const host_control::Request &, host_control::CommandResult &) { return false; });
+
+	ASSERT_EQ(writes.size(), 2u);
+	EXPECT_EQ(writes[1], "{\"event\":\"error\",\"id\":\"8\",\"message\":\"unsupported key\"}\n");
+}
+
+TEST(HostControlProtocolTest, SessionRunnerQueuesInputKey)
+{
+	host_control::clear_queued_input();
+	std::vector<std::string> writes = {};
+	std::vector<std::string> requests = {R"({"id":"9","op":"key","key":"enter"})"};
+	std::size_t next_request = 0;
+	bool exec_called = false;
+
+	const auto read_line = [&](std::string &line) {
+		if (next_request >= requests.size()) {
+			return false;
+		}
+		line = requests[next_request++];
+		return true;
+	};
+
+	const auto write_line = [&](const std::string &line) {
+		writes.push_back(line);
+		return true;
+	};
+
+	const auto result = host_control::run_control_session(
+	        {host_control::Transport::Socket, "/tmp/test.sock"},
+	        read_line,
+	        write_line,
+	        [&](const host_control::Request &, host_control::CommandResult &) {
+		        exec_called = true;
+		        return false;
+	        });
+
+	EXPECT_TRUE(result.started);
+	EXPECT_FALSE(exec_called);
+	ASSERT_EQ(writes.size(), 2u);
+	EXPECT_EQ(writes[1], "{\"event\":\"input_result\",\"id\":\"9\",\"ok\":true,\"queued\":1}\n");
+
+	std::vector<uint16_t> drained = {};
+	EXPECT_EQ(host_control::drain_queued_input_codes_for_test(drained, 8), 1u);
+	host_control::clear_queued_input();
+}
+
+TEST(HostControlProtocolTest, SessionRunnerReportsInputQueueFullWithoutExec)
+{
+	host_control::clear_queued_input();
+	const std::vector<uint16_t> fill_codes(1024, static_cast<uint16_t>('x'));
+	ASSERT_TRUE(host_control::queue_input_codes(fill_codes).ok);
+
+	std::vector<std::string> writes = {};
+	std::vector<std::string> requests = {R"({"id":"10","op":"key","key":"enter"})"};
+	std::size_t next_request = 0;
+	bool exec_called = false;
+
+	const auto read_line = [&](std::string &line) {
+		if (next_request >= requests.size()) {
+			return false;
+		}
+		line = requests[next_request++];
+		return true;
+	};
+
+	const auto write_line = [&](const std::string &line) {
+		writes.push_back(line);
+		return true;
+	};
+
+	const auto result = host_control::run_control_session(
+	        {host_control::Transport::Socket, "/tmp/test.sock"},
+	        read_line,
+	        write_line,
+	        [&](const host_control::Request &, host_control::CommandResult &) {
+		        exec_called = true;
+		        return false;
+	        });
+
+	EXPECT_TRUE(result.started);
+	EXPECT_FALSE(exec_called);
+	ASSERT_EQ(writes.size(), 2u);
+	EXPECT_EQ(writes[1], "{\"event\":\"error\",\"id\":\"10\",\"message\":\"input queue full\"}\n");
+	host_control::clear_queued_input();
+}
+
+TEST(HostControlProtocolTest, SessionRunnerEmitsStatusWithoutResult)
+{
+	const ScopedHostControlDosState dos_state = {};
+	ASSERT_NE(Drives[25], nullptr);
+	DOS_SetDefaultDrive(25);
+	std::strcpy(Drives[25]->curdir, "");
+	dos.return_code = 0;
+
+	std::vector<std::string> writes = {};
+	std::vector<std::string> requests = {R"({"id":"7","op":"status"})"};
+	std::size_t next_request = 0;
+
+	const auto read_line = [&](std::string &line) {
+		if (next_request >= requests.size()) {
+			line.clear();
+			return false;
+		}
+		line = requests[next_request++];
+		return true;
+	};
+	const auto write_line = [&](const std::string &line) {
+		writes.push_back(line);
+		return true;
+	};
+	const auto exec_request = [&](const host_control::Request &, host_control::CommandResult &) {
+		ADD_FAILURE() << "status must not execute shell commands";
+		return false;
+	};
+
+	const auto session = host_control::run_control_session(
+	        host_control::Options{host_control::Transport::Socket, "/tmp/d.sock"},
+	        read_line,
+	        write_line,
+	        exec_request);
+
+	EXPECT_TRUE(session.started);
+	EXPECT_FALSE(session.had_io_error);
+	ASSERT_EQ(writes.size(), 2u);
+	EXPECT_EQ(writes[0],
+	          "{\"event\":\"ready\",\"transport\":\"socket\",\"endpoint\":\"/tmp/d.sock\"}\n");
+	EXPECT_EQ(writes[1],
+	          "{\"event\":\"status\",\"id\":\"7\",\"transport\":\"socket\",\"session_active\":true,\"errorlevel\":0,\"drive\":\"Z\",\"cwd\":\"Z:\\\\\"}\n");
+}
+
+TEST(HostControlProtocolTest, SessionRunnerStatusReflectsUpdatedStateBetweenCommands)
+{
+	const ScopedHostControlDosState dos_state = {};
+	ASSERT_NE(Drives[25], nullptr);
+	DOS_SetDefaultDrive(25);
+	std::strcpy(Drives[25]->curdir, "");
+	dos.return_code = 0;
+
+	std::vector<std::string> writes = {};
+	std::vector<std::string> requests = {
+	        R"({"id":"1","op":"exec","command":"cd \\build"})",
+	        R"({"id":"2","op":"status"})",
+	};
+	std::size_t next_request = 0;
+
+	const auto read_line = [&](std::string &line) {
+		if (next_request >= requests.size()) {
+			line.clear();
+			return false;
+		}
+		line = requests[next_request++];
+		return true;
+	};
+	const auto write_line = [&](const std::string &line) {
+		writes.push_back(line);
+		return true;
+	};
+	const auto exec_request = [&](const host_control::Request &request,
+	                              host_control::CommandResult &result) {
+		EXPECT_EQ(request.op, "exec");
+		EXPECT_EQ(request.command, "cd \\build");
+		DOS_SetDefaultDrive(25);
+		std::strcpy(Drives[25]->curdir, "BUILD");
+		dos.return_code = 7;
+		result.shell_exit = false;
+		result.errorlevel = 7;
+		result.drive = "Z";
+		result.cwd = "Z:\\BUILD";
+		return true;
+	};
+
+	const auto session = host_control::run_control_session(
+	        host_control::Options{host_control::Transport::Stdio, ""},
+	        read_line,
+	        write_line,
+	        exec_request);
+
+	EXPECT_TRUE(session.started);
+	EXPECT_FALSE(session.had_io_error);
+	ASSERT_EQ(writes.size(), 3u);
+	EXPECT_EQ(writes[0], "{\"event\":\"ready\",\"transport\":\"stdio\"}\n");
+	EXPECT_NE(writes[1].find("\"event\":\"result\""), std::string::npos);
+	EXPECT_EQ(writes[2],
+	          "{\"event\":\"status\",\"id\":\"2\",\"transport\":\"stdio\",\"session_active\":true,\"errorlevel\":7,\"drive\":\"Z\",\"cwd\":\"Z:\\\\BUILD\"}\n");
+}
+
 TEST(HostControlProtocolTest, SessionRunnerFlushesBufferedOutputBeforeStructuredResult)
 {
 	std::vector<std::string> writes = {};
@@ -384,6 +915,135 @@ TEST(HostControlProtocolTest, SessionRunnerEmitsStructuredResultMetadata)
 }
 
 #if defined(__unix__) || defined(__APPLE__)
+TEST(HostControlProtocolTest, SocketSessionAcceptsInputWhileExecIsRunning)
+{
+	host_control::clear_queued_input();
+	int fds[2] = {-1, -1};
+	ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+	std::promise<void> exec_started;
+	std::promise<void> allow_exec_finish;
+	auto exec_started_future = exec_started.get_future();
+	auto allow_exec_finish_future = allow_exec_finish.get_future();
+	std::thread server;
+	SocketSessionTestCleanup cleanup(allow_exec_finish, fds[1], server);
+
+	server = std::thread([&]() {
+		(void)host_control::run_control_socket_session(
+		        {host_control::Transport::Socket, "/tmp/test.sock"},
+		        fds[0],
+		        [&](const host_control::Request &, host_control::CommandResult &result) {
+			        exec_started.set_value();
+			        allow_exec_finish_future.wait();
+			        result.shell_exit = false;
+			        result.errorlevel = 0;
+			        result.drive = "Z";
+			        result.cwd = "Z:\\";
+			        return true;
+		        });
+	});
+
+	auto read_line = [&](std::string &line) {
+		line.clear();
+		for (;;) {
+			char byte = 0;
+			const auto received = read(fds[1], &byte, 1);
+			if (received <= 0) {
+				return false;
+			}
+			if (byte == '\n') {
+				return true;
+			}
+			line += byte;
+		}
+	};
+
+	std::string line = {};
+	ASSERT_TRUE(read_line(line));
+	EXPECT_NE(line.find(R"("event":"ready")"), std::string::npos);
+
+	const std::string exec_request = R"({"id":"1","op":"exec","command":"hang"})" "\n";
+	ASSERT_EQ(write(fds[1], exec_request.data(), exec_request.size()),
+	          static_cast<ssize_t>(exec_request.size()));
+	ASSERT_EQ(exec_started_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+
+	const std::string input_request = R"({"id":"2","op":"input_text","text":"dir\n"})" "\n";
+	ASSERT_EQ(write(fds[1], input_request.data(), input_request.size()),
+	          static_cast<ssize_t>(input_request.size()));
+
+	ASSERT_TRUE(read_line(line));
+	EXPECT_NE(line.find(R"("event":"input_result")"), std::string::npos);
+	EXPECT_NE(line.find(R"("id":"2")"), std::string::npos);
+
+	cleanup.release_exec();
+	ASSERT_TRUE(read_line(line));
+	EXPECT_NE(line.find(R"("event":"result")"), std::string::npos);
+	EXPECT_NE(line.find(R"("id":"1")"), std::string::npos);
+}
+
+TEST(HostControlProtocolTest, SocketSessionDisconnectDuringExecDoesNotEmitResult)
+{
+	host_control::clear_queued_input();
+	int fds[2] = {-1, -1};
+	ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+	std::promise<void> exec_started;
+	std::promise<void> allow_exec_finish;
+	auto exec_started_future = exec_started.get_future();
+	auto allow_exec_finish_future = allow_exec_finish.get_future();
+	host_control::SessionResult session = {};
+	std::thread server;
+	SocketSessionTestCleanup cleanup(allow_exec_finish, fds[1], server);
+
+	server = std::thread([&]() {
+		session = host_control::run_control_socket_session(
+		        {host_control::Transport::Socket, "/tmp/test.sock"},
+		        fds[0],
+		        [&](const host_control::Request &, host_control::CommandResult &result) {
+			        exec_started.set_value();
+			        allow_exec_finish_future.wait();
+			        result.shell_exit = false;
+			        result.errorlevel = 0;
+			        result.drive = "Z";
+			        result.cwd = "Z:\\";
+			        return true;
+		        });
+	});
+
+	auto read_line = [&](std::string &line) {
+		line.clear();
+		for (;;) {
+			char byte = 0;
+			const auto received = read(fds[1], &byte, 1);
+			if (received <= 0) {
+				return false;
+			}
+			if (byte == '\n') {
+				return true;
+			}
+			line += byte;
+		}
+	};
+
+	std::string line = {};
+	ASSERT_TRUE(read_line(line));
+	EXPECT_NE(line.find(R"("event":"ready")"), std::string::npos);
+
+	const std::string exec_request = R"({"id":"1","op":"exec","command":"hang"})" "\n";
+	ASSERT_EQ(write(fds[1], exec_request.data(), exec_request.size()),
+	          static_cast<ssize_t>(exec_request.size()));
+	ASSERT_EQ(exec_started_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+
+	ASSERT_EQ(shutdown(fds[1], SHUT_WR), 0);
+	cleanup.release_exec();
+	ASSERT_FALSE(read_line(line)) << line;
+	if (server.joinable()) {
+		server.join();
+	}
+	EXPECT_TRUE(session.started);
+	EXPECT_FALSE(session.had_io_error);
+}
+
 TEST(HostControlProtocolTest, SocketServerRejectsEmptyEndpoint)
 {
 	host_control::SocketServer server = {};

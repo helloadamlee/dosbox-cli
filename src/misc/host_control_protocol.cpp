@@ -182,18 +182,42 @@ Request parse_request_line(const std::string &line)
 	}
 
 	request.op = op_it->second;
-	if (request.op != "exec") {
+	if (request.op != "exec" && request.op != "status" &&
+	    request.op != "input_text" && request.op != "key") {
 		request.error = "unsupported op";
 		return request;
 	}
 
-	const auto command_it = values.find("command");
-	if (command_it == values.end()) {
-		request.error = "missing command";
-		return request;
+	if (request.op == "exec") {
+		const auto command_it = values.find("command");
+		if (command_it == values.end()) {
+			request.error = "missing command";
+			return request;
+		}
+
+		request.command = command_it->second;
 	}
 
-	request.command = command_it->second;
+	if (request.op == "input_text") {
+		const auto text_it = values.find("text");
+		if (text_it == values.end()) {
+			request.error = "missing text";
+			return request;
+		}
+
+		request.text = text_it->second;
+	}
+
+	if (request.op == "key") {
+		const auto key_it = values.find("key");
+		if (key_it == values.end() || key_it->second.empty()) {
+			request.error = "missing key";
+			return request;
+		}
+
+		request.key = key_it->second;
+	}
+
 	request.ok = true;
 	return request;
 }
@@ -252,6 +276,38 @@ std::string make_exec_result_json_line(const std::string &id,
 	json += json_escape(result.cwd);
 	json += "\",\"duration_ms\":";
 	json += std::to_string(result.duration_ms);
+	json += "}\n";
+	return json;
+}
+
+std::string make_status_json_line(const std::string &id, const StatusSnapshot &snapshot)
+{
+	std::string json = "{\"event\":\"status\",\"id\":\"";
+	json += json_escape(id);
+	json += "\",\"transport\":\"";
+	json += transport_to_string(snapshot.transport);
+	json += "\",\"session_active\":";
+	json += snapshot.session_active ? "true" : "false";
+	json += ",\"errorlevel\":";
+	json += std::to_string(snapshot.errorlevel);
+	json += ",\"drive\":\"";
+	json += json_escape(snapshot.drive);
+	json += "\",\"cwd\":\"";
+	json += json_escape(snapshot.cwd);
+	json += "\"}\n";
+	return json;
+}
+
+std::string make_input_result_json_line(const std::string &id,
+                                        const bool ok,
+                                        const std::size_t queued)
+{
+	std::string json = "{\"event\":\"input_result\",\"id\":\"";
+	json += json_escape(id);
+	json += "\",\"ok\":";
+	json += ok ? "true" : "false";
+	json += ",\"queued\":";
+	json += std::to_string(queued);
 	json += "}\n";
 	return json;
 }
@@ -332,6 +388,11 @@ bool is_stdio_enabled(const Options &options)
 bool is_socket_enabled(const Options &options)
 {
 	return options.transport == Transport::Socket;
+}
+
+bool is_pipe_enabled(const Options &options)
+{
+	return options.transport == Transport::Pipe;
 }
 
 } // namespace host_control

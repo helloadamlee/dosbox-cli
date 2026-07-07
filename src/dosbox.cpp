@@ -67,6 +67,7 @@
 #include "dos_inc.h"
 #include "setup.h"
 #include "control.h"
+#include "host_control.h"
 #include "cross.h"
 #include "programs.h"
 #include "support.h"
@@ -466,6 +467,7 @@ static Bitu Normal_Loop(void) {
 
     try {
         while (1) {
+            (void)host_control::drain_queued_input();
             if (PIC_RunQueue()) {
                 /* now is the time to check for the NMI (Non-maskable interrupt) */
                 CPU_Check_NMI();

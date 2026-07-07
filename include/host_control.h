@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace host_control {
 
@@ -25,6 +26,8 @@ struct Request {
 	std::string id = {};
 	std::string op = {};
 	std::string command = {};
+	std::string text = {};
+	std::string key = {};
 	std::string error = {};
 };
 
@@ -42,9 +45,23 @@ struct CommandResult {
 	uint64_t duration_ms = 0;
 };
 
+struct StatusSnapshot {
+	Transport transport = Transport::Disabled;
+	bool session_active = false;
+	uint32_t errorlevel = 0;
+	std::string drive = {};
+	std::string cwd = {};
+};
+
 struct SessionResult {
 	bool started = false;
 	bool had_io_error = false;
+};
+
+struct InputQueueResult {
+	bool ok = false;
+	std::size_t queued = 0;
+	std::string error = {};
 };
 
 struct SocketServer {
@@ -110,6 +127,8 @@ std::string make_output_bytes_json_line(const std::string &id, const uint8_t *da
 std::string make_exec_result_json_line(const std::string &id,
                                        bool ok,
                                        const CommandResult &result);
+std::string make_status_json_line(const std::string &id, const StatusSnapshot &snapshot);
+std::string make_input_result_json_line(const std::string &id, bool ok, std::size_t queued);
 void reset_buffered_output(BufferedOutput &buffer, const std::string &request_id);
 void append_buffered_output(BufferedOutput &buffer, const uint8_t *data, std::size_t size, uint64_t now_ms);
 bool has_buffered_output(const BufferedOutput &buffer);
@@ -121,14 +140,29 @@ std::string flush_buffered_output_json_line(BufferedOutput &buffer);
 bool should_capture_dos_write(uint16_t info, const char *name);
 bool is_stdio_enabled(const Options &options);
 bool is_socket_enabled(const Options &options);
+bool is_pipe_enabled(const Options &options);
 SessionResult run_control_session(const Options &options,
                                   const ReadLineFn &read_line,
                                   const WriteLineFn &write_line,
                                   const ExecRequestFn &exec_request);
+SessionResult run_control_socket_session(const Options &options,
+                                         int client_fd,
+                                         const ExecRequestFn &exec_request);
 bool run_stdio_shell();
+bool run_pipe_shell();
 bool open_socket_server(const std::string &path, SocketServer &server, std::string &error);
 void close_socket_server(SocketServer &server);
 bool run_socket_shell();
+bool build_input_codes_for_text(const std::string &text,
+                                std::vector<uint16_t> &codes,
+                                std::string &error);
+bool build_input_codes_for_key(const std::string &key,
+                               std::vector<uint16_t> &codes,
+                               std::string &error);
+InputQueueResult queue_input_codes(const std::vector<uint16_t> &codes);
+void clear_queued_input();
+std::size_t drain_queued_input();
+std::size_t drain_queued_input_codes_for_test(std::vector<uint16_t> &codes, std::size_t max_codes);
 void capture_dos_write(uint16_t info, const char *name, const uint8_t *data, std::size_t size);
 
 } // namespace host_control
