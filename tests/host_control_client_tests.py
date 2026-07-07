@@ -379,6 +379,47 @@ class HostControlClientTest(unittest.TestCase):
         with self.assertRaisesRegex(module.WorkflowError, "step 0: expected object"):
             module.parse_workflow_recipe({"steps": ["exec dir"]})
 
+    def test_parse_workflow_recipe_accepts_interactive_exec_steps(self):
+        module = load_client_module()
+        recipe = {
+            "steps": [
+                {
+                    "exec_interactive": {
+                        "command": "pause",
+                        "steps": [
+                            {"wait_for": "output"},
+                            {"key": "enter"},
+                            {"wait_for": {"event": "result", "ok": True}},
+                        ],
+                    }
+                }
+            ]
+        }
+
+        steps = module.parse_workflow_recipe(recipe)
+
+        self.assertEqual(steps[0].action, "exec_interactive")
+        self.assertEqual(steps[0].value["command"], "pause")
+        nested = steps[0].value["steps"]
+        self.assertEqual([step.action for step in nested], ["wait_for", "key", "wait_for"])
+        self.assertEqual(nested[1].value, "enter")
+
+    def test_parse_workflow_recipe_rejects_malformed_interactive_exec_steps(self):
+        module = load_client_module()
+
+        with self.assertRaisesRegex(module.WorkflowError, "step 0: exec_interactive must be an object"):
+            module.parse_workflow_recipe({"steps": [{"exec_interactive": "pause"}]})
+        with self.assertRaisesRegex(module.WorkflowError, "step 0: exec_interactive.command"):
+            module.parse_workflow_recipe({"steps": [{"exec_interactive": {"steps": []}}]})
+        with self.assertRaisesRegex(module.WorkflowError, "step 0: exec_interactive.steps"):
+            module.parse_workflow_recipe(
+                {"steps": [{"exec_interactive": {"command": "pause"}}]}
+            )
+        with self.assertRaisesRegex(module.WorkflowError, "step 0.0: expected object"):
+            module.parse_workflow_recipe(
+                {"steps": [{"exec_interactive": {"command": "pause", "steps": ["key enter"]}}]}
+            )
+
     def test_parse_args_accepts_workflow_and_transcript(self):
         module = load_client_module()
 

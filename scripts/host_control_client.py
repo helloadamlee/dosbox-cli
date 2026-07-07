@@ -25,7 +25,15 @@ class WorkflowStep:
     value: object = None
 
 
-WORKFLOW_ACTIONS = {"comment", "exec", "status", "input_text", "key", "wait_for"}
+WORKFLOW_ACTIONS = {
+    "comment",
+    "exec",
+    "exec_interactive",
+    "status",
+    "input_text",
+    "key",
+    "wait_for",
+}
 WAIT_EVENT_ALIASES = {"ready", "output", "result", "status", "error", "input_result"}
 
 
@@ -35,11 +43,15 @@ def parse_workflow_recipe(recipe):
     steps = recipe.get("steps")
     if not isinstance(steps, list):
         raise WorkflowError("recipe.steps: expected array")
+    return parse_workflow_steps(steps)
 
+
+def parse_workflow_steps(steps, prefix="step"):
     parsed = []
     for index, step in enumerate(steps):
+        step_name = f"{prefix} {index}" if prefix == "step" else f"{prefix}.{index}"
         if not isinstance(step, dict):
-            raise WorkflowError(f"step {index}: expected object")
+            raise WorkflowError(f"{step_name}: expected object")
         if not step:
             parsed.append(WorkflowStep("noop"))
             continue
@@ -47,30 +59,45 @@ def parse_workflow_recipe(recipe):
         actions = [key for key in step if key in WORKFLOW_ACTIONS]
         unknown = [key for key in step if key not in WORKFLOW_ACTIONS]
         if unknown:
-            raise WorkflowError(f"step {index}: unknown action {unknown[0]}")
+            raise WorkflowError(f"{step_name}: unknown action {unknown[0]}")
         if len(actions) != 1:
-            raise WorkflowError(f"step {index}: multiple actions")
+            raise WorkflowError(f"{step_name}: multiple actions")
 
         action = actions[0]
         value = step[action]
         if action == "comment":
             if not isinstance(value, str):
-                raise WorkflowError(f"step {index}: comment must be a string")
+                raise WorkflowError(f"{step_name}: comment must be a string")
         elif action == "exec":
             if not isinstance(value, str) or not value:
-                raise WorkflowError(f"step {index}: exec must be a non-empty string")
+                raise WorkflowError(f"{step_name}: exec must be a non-empty string")
+        elif action == "exec_interactive":
+            if not isinstance(value, dict):
+                raise WorkflowError(f"{step_name}: exec_interactive must be an object")
+            command = value.get("command")
+            if not isinstance(command, str) or not command:
+                raise WorkflowError(
+                    f"{step_name}: exec_interactive.command must be a non-empty string"
+                )
+            nested_steps = value.get("steps")
+            if not isinstance(nested_steps, list):
+                raise WorkflowError(f"{step_name}: exec_interactive.steps must be an array")
+            value = {
+                "command": command,
+                "steps": parse_workflow_steps(nested_steps, prefix=f"{step_name}"),
+            }
         elif action == "status":
             if value not in (True, None) and value != {}:
-                raise WorkflowError(f"step {index}: status must be true, null, or object")
+                raise WorkflowError(f"{step_name}: status must be true, null, or object")
         elif action == "input_text":
             if not isinstance(value, str):
-                raise WorkflowError(f"step {index}: input_text must be a string")
+                raise WorkflowError(f"{step_name}: input_text must be a string")
         elif action == "key":
             if not isinstance(value, str) or not value:
-                raise WorkflowError(f"step {index}: key must be a non-empty string")
+                raise WorkflowError(f"{step_name}: key must be a non-empty string")
         elif action == "wait_for":
             if not isinstance(value, (str, dict)):
-                raise WorkflowError(f"step {index}: wait_for must be a string or object")
+                raise WorkflowError(f"{step_name}: wait_for must be a string or object")
         parsed.append(WorkflowStep(action, value))
     return parsed
 
