@@ -1,13 +1,16 @@
 #include "host_control.h"
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -35,7 +38,7 @@ struct PendingInputCode {
 };
 
 bool session_active = false;
-bool session_write_failed = false;
+std::atomic<bool> session_write_failed = {false};
 std::string active_request_id = {};
 BufferedOutput buffered_output = {};
 WriteLineFn active_write_line = {};
@@ -85,12 +88,12 @@ bool emit_session_line(const std::string &line)
 	}
 
 	if (!active_write_line) {
-		session_write_failed = true;
+		session_write_failed.store(true);
 		return false;
 	}
 
 	if (!active_write_line(line)) {
-		session_write_failed = true;
+		session_write_failed.store(true);
 		return false;
 	}
 
@@ -102,7 +105,7 @@ void reset_session_state()
 	reset_buffered_output(buffered_output, {});
 	active_request_id.clear();
 	active_write_line = {};
-	session_write_failed = false;
+	session_write_failed.store(false);
 	session_active = false;
 }
 
@@ -175,6 +178,90 @@ void close_fd(int &fd)
 		fd = -1;
 	}
 }
+
+struct SocketSessionState {
+	Options options = {};
+	int client_fd = -1;
+	std::mutex mutex = {};
+	std::condition_variable condition = {};
+	std::deque<Request> requests = {};
+	bool disconnected = false;
+	bool had_io_error = false;
+};
+
+bool write_socket_session_line(SocketSessionState &state, const std::string &line)
+{
+	if (line.empty()) {
+		return true;
+	}
+
+	std::lock_guard<std::mutex> lock(state.mutex);
+	if (!write_fd_line(state.client_fd, line)) {
+		state.had_io_error = true;
+		state.disconnected = true;
+		session_write_failed.store(true);
+		state.condition.notify_all();
+		return false;
+	}
+
+	return true;
+}
+
+void handle_socket_input_request(SocketSessionState &state, const Request &request)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+	const bool built = request.op == "input_text"
+	                         ? build_input_codes_for_text(request.text, codes, error)
+	                         : build_input_codes_for_key(request.key, codes, error);
+	if (!built) {
+		(void)write_socket_session_line(state, make_error_json_line(request.id, error));
+		return;
+	}
+
+	const auto queued = queue_input_codes(codes);
+	if (!queued.ok) {
+		(void)write_socket_session_line(state, make_error_json_line(request.id, queued.error));
+		return;
+	}
+
+	(void)write_socket_session_line(
+	        state, make_input_result_json_line(request.id, true, queued.queued));
+}
+
+void socket_session_reader(SocketSessionState &state)
+{
+	for (;;) {
+		std::string line = {};
+		if (!read_fd_line(state.client_fd, line)) {
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.disconnected = true;
+			state.condition.notify_all();
+			return;
+		}
+		if (line.empty()) {
+			continue;
+		}
+
+		const auto request = parse_request_line(line);
+		if (!request.ok) {
+			(void)write_socket_session_line(
+			        state, make_error_json_line(request.id, request.error));
+			continue;
+		}
+
+		if (request.op == "input_text" || request.op == "key") {
+			handle_socket_input_request(state, request);
+			continue;
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.requests.push_back(request);
+		}
+		state.condition.notify_all();
+	}
+}
 #else
 bool read_stdin_line(std::string &line)
 {
@@ -215,7 +302,7 @@ SessionResult run_control_session(const Options &options,
 	active_write_line = write_line;
 	active_request_id.clear();
 	reset_buffered_output(buffered_output, {});
-	session_write_failed = false;
+	session_write_failed.store(false);
 	session_active = true;
 
 	if (!emit_session_line(make_ready_json_line(options))) {
@@ -297,7 +384,7 @@ SessionResult run_control_session(const Options &options,
 		const bool ok = exec_request(request, command_result);
 		const auto end_ms = get_monotonic_ms();
 		command_result.duration_ms = end_ms >= start_ms ? (end_ms - start_ms) : 0;
-		if (session_write_failed ||
+		if (session_write_failed.load() ||
 		    !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
 			result.had_io_error = true;
 			active_request_id.clear();
@@ -320,6 +407,116 @@ SessionResult run_control_session(const Options &options,
 
 	reset_session_state();
 	return result;
+}
+
+SessionResult run_control_socket_session(const Options &options,
+                                         int client_fd,
+                                         const ExecRequestFn &exec_request)
+{
+	SessionResult result = {};
+
+#if !defined(__unix__) && !defined(__APPLE__)
+	(void)options;
+	(void)client_fd;
+	(void)exec_request;
+	result.had_io_error = true;
+	return result;
+#else
+	SocketSessionState state = {};
+	state.options = options;
+	state.client_fd = client_fd;
+
+	active_write_line = [&state](const std::string &line) {
+		return write_socket_session_line(state, line);
+	};
+	active_request_id.clear();
+	reset_buffered_output(buffered_output, {});
+	session_write_failed.store(false);
+	session_active = true;
+
+	if (!emit_session_line(make_ready_json_line(options))) {
+		result.had_io_error = true;
+		close_fd(state.client_fd);
+		reset_session_state();
+		return result;
+	}
+
+	result.started = true;
+	std::thread reader(socket_session_reader, std::ref(state));
+
+	for (;;) {
+		Request request = {};
+		{
+			std::unique_lock<std::mutex> lock(state.mutex);
+			state.condition.wait(lock, [&state]() {
+				return !state.requests.empty() || state.disconnected;
+			});
+			if (!state.requests.empty()) {
+				request = state.requests.front();
+				state.requests.pop_front();
+			} else if (state.disconnected) {
+				break;
+			}
+		}
+
+		if (request.op == "status") {
+			if (!emit_session_line(make_status_json_line(request.id, snapshot_status(options)))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
+		if (request.op != "exec") {
+			if (!emit_session_line(make_error_json_line(request.id, "unsupported op"))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
+		CommandResult command_result = {};
+		active_request_id = request.id;
+		reset_buffered_output(buffered_output, request.id);
+		const auto start_ms = get_monotonic_ms();
+		const bool ok = exec_request(request, command_result);
+		const auto end_ms = get_monotonic_ms();
+		command_result.duration_ms = end_ms >= start_ms ? (end_ms - start_ms) : 0;
+		if (session_write_failed.load() ||
+		    !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
+			result.had_io_error = true;
+			active_request_id.clear();
+			break;
+		}
+		active_request_id.clear();
+
+		if (!emit_session_line(make_exec_result_json_line(request.id, ok, command_result))) {
+			result.had_io_error = true;
+			break;
+		}
+		if (command_result.shell_exit) {
+			break;
+		}
+	}
+
+	if (!result.had_io_error && !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
+		result.had_io_error = true;
+	}
+
+	(void)shutdown(state.client_fd, SHUT_RDWR);
+	if (reader.joinable()) {
+		reader.join();
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(state.mutex);
+		result.had_io_error = result.had_io_error || state.had_io_error;
+	}
+
+	close_fd(state.client_fd);
+	reset_session_state();
+	return result;
+#endif
 }
 
 bool run_stdio_shell()
@@ -477,10 +674,9 @@ bool run_socket_shell()
 		return false;
 	}
 
-	const auto result = run_control_session(
+	const auto result = run_control_socket_session(
 	        control->opt_host_control,
-	        [client_fd](std::string &line) { return read_fd_line(client_fd, line); },
-	        [client_fd](const std::string &line) { return write_fd_line(client_fd, line); },
+	        client_fd,
 	        [](const Request &request, CommandResult &result) {
 		        const bool ok = SHELL_ExecuteHostCommand(request.command, result.shell_exit);
 		        if (ok) {
@@ -489,7 +685,6 @@ bool run_socket_shell()
 		        return ok;
 	        });
 
-	close_fd(client_fd);
 	close_socket_server(server);
 	return result.started;
 #endif

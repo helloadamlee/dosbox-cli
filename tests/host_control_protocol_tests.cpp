@@ -7,10 +7,12 @@
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <future>
 #include <thread>
 #include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
+#include <sys/socket.h>
 #include <unistd.h>
 #endif
 
@@ -876,6 +878,74 @@ TEST(HostControlProtocolTest, SessionRunnerEmitsStructuredResultMetadata)
 }
 
 #if defined(__unix__) || defined(__APPLE__)
+TEST(HostControlProtocolTest, SocketSessionAcceptsInputWhileExecIsRunning)
+{
+	host_control::clear_queued_input();
+	int fds[2] = {-1, -1};
+	ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+	std::promise<void> exec_started;
+	std::promise<void> allow_exec_finish;
+	auto exec_started_future = exec_started.get_future();
+	auto allow_exec_finish_future = allow_exec_finish.get_future();
+
+	std::thread server([&]() {
+		(void)host_control::run_control_socket_session(
+		        {host_control::Transport::Socket, "/tmp/test.sock"},
+		        fds[0],
+		        [&](const host_control::Request &, host_control::CommandResult &result) {
+			        exec_started.set_value();
+			        allow_exec_finish_future.wait();
+			        result.shell_exit = false;
+			        result.errorlevel = 0;
+			        result.drive = "Z";
+			        result.cwd = "Z:\\";
+			        return true;
+		        });
+	});
+
+	auto read_line = [&](std::string &line) {
+		line.clear();
+		for (;;) {
+			char byte = 0;
+			const auto received = read(fds[1], &byte, 1);
+			if (received <= 0) {
+				return false;
+			}
+			if (byte == '\n') {
+				return true;
+			}
+			line += byte;
+		}
+	};
+
+	std::string line = {};
+	ASSERT_TRUE(read_line(line));
+	EXPECT_NE(line.find(R"("event":"ready")"), std::string::npos);
+
+	const std::string exec_request = R"({"id":"1","op":"exec","command":"hang"})" "\n";
+	ASSERT_EQ(write(fds[1], exec_request.data(), exec_request.size()),
+	          static_cast<ssize_t>(exec_request.size()));
+	ASSERT_EQ(exec_started_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+
+	const std::string input_request = R"({"id":"2","op":"input_text","text":"dir\n"})" "\n";
+	ASSERT_EQ(write(fds[1], input_request.data(), input_request.size()),
+	          static_cast<ssize_t>(input_request.size()));
+
+	ASSERT_TRUE(read_line(line));
+	EXPECT_NE(line.find(R"("event":"input_result")"), std::string::npos);
+	EXPECT_NE(line.find(R"("id":"2")"), std::string::npos);
+
+	allow_exec_finish.set_value();
+	ASSERT_TRUE(read_line(line));
+	EXPECT_NE(line.find(R"("event":"result")"), std::string::npos);
+	EXPECT_NE(line.find(R"("id":"1")"), std::string::npos);
+
+	close(fds[1]);
+	server.join();
+	host_control::clear_queued_input();
+}
+
 TEST(HostControlProtocolTest, SocketServerRejectsEmptyEndpoint)
 {
 	host_control::SocketServer server = {};

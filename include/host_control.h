@@ -145,6 +145,9 @@ SessionResult run_control_session(const Options &options,
                                   const ReadLineFn &read_line,
                                   const WriteLineFn &write_line,
                                   const ExecRequestFn &exec_request);
+SessionResult run_control_socket_session(const Options &options,
+                                         int client_fd,
+                                         const ExecRequestFn &exec_request);
 bool run_stdio_shell();
 bool run_pipe_shell();
 bool open_socket_server(const std::string &path, SocketServer &server, std::string &error);
