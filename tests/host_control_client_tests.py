@@ -537,6 +537,54 @@ class HostControlClientTest(unittest.TestCase):
                 ],
             )
 
+    def test_socket_workflow_interactive_exec_preserves_early_parent_result(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            recipe_path = self._write_recipe(
+                tmpdir,
+                {
+                    "steps": [
+                        {
+                            "exec_interactive": {
+                                "command": "fast",
+                                "steps": [
+                                    {"wait_for": "output"},
+                                    {"key": "enter"},
+                                    {"wait_for": {"event": "result", "id": "1", "ok": True}},
+                                ],
+                            }
+                        }
+                    ]
+                },
+            )
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"output","id":"1","encoding":"base64","data":"Z29pbmc="}\n',
+                '{"event":"result","id":"1","ok":true,"shell_exit":false,"errorlevel":0,"drive":"Z","cwd":"Z:\\\\","duration_ms":1}\n',
+                '{"event":"input_result","id":"2","ok":true,"queued":1}\n',
+            ]
+            thread = self._serve_socket_workflow(sock_path, lines, requests, expected_requests=2)
+
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "socket", sock_path, "workflow", str(recipe_path)],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.join(timeout=2)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertEqual(
+                requests,
+                [
+                    '{"id":"1","op":"exec","command":"fast"}\n',
+                    '{"id":"2","op":"key","key":"enter"}\n',
+                ],
+            )
+
     def test_socket_workflow_wait_for_matches_output_event(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             sock_path = str(Path(tmpdir) / "control.sock")
