@@ -8,10 +8,70 @@ import socket
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 
 
 class RequestTimeout(RuntimeError):
     pass
+
+
+class WorkflowError(RuntimeError):
+    pass
+
+
+@dataclass
+class WorkflowStep:
+    action: str
+    value: object = None
+
+
+WORKFLOW_ACTIONS = {"comment", "exec", "status", "input_text", "key", "wait_for"}
+
+
+def parse_workflow_recipe(recipe):
+    if not isinstance(recipe, dict):
+        raise WorkflowError("recipe: expected object")
+    steps = recipe.get("steps")
+    if not isinstance(steps, list):
+        raise WorkflowError("recipe.steps: expected array")
+
+    parsed = []
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            raise WorkflowError(f"step {index}: expected object")
+        if not step:
+            parsed.append(WorkflowStep("noop"))
+            continue
+
+        actions = [key for key in step if key in WORKFLOW_ACTIONS]
+        unknown = [key for key in step if key not in WORKFLOW_ACTIONS]
+        if unknown:
+            raise WorkflowError(f"step {index}: unknown action {unknown[0]}")
+        if len(actions) != 1:
+            raise WorkflowError(f"step {index}: multiple actions")
+
+        action = actions[0]
+        value = step[action]
+        if action == "comment":
+            if not isinstance(value, str):
+                raise WorkflowError(f"step {index}: comment must be a string")
+        elif action == "exec":
+            if not isinstance(value, str) or not value:
+                raise WorkflowError(f"step {index}: exec must be a non-empty string")
+        elif action == "status":
+            if value not in (True, None) and value != {}:
+                raise WorkflowError(f"step {index}: status must be true, null, or object")
+        elif action == "input_text":
+            if not isinstance(value, str):
+                raise WorkflowError(f"step {index}: input_text must be a string")
+        elif action == "key":
+            if not isinstance(value, str) or not value:
+                raise WorkflowError(f"step {index}: key must be a non-empty string")
+        elif action == "wait_for":
+            if not isinstance(value, (str, dict)):
+                raise WorkflowError(f"step {index}: wait_for must be a string or object")
+        parsed.append(WorkflowStep(action, value))
+    return parsed
 
 
 def encode_request(request_id, op, command=None, text=None, key=None):
@@ -280,15 +340,26 @@ def parse_args(argv):
         default=None,
         help="seconds to wait for each host-control response",
     )
+    parser.add_argument(
+        "--transcript",
+        default=None,
+        help="write workflow events to a JSONL transcript",
+    )
     subparsers = parser.add_subparsers(dest="transport", required=True)
 
     socket_parser = subparsers.add_parser("socket")
     socket_parser.add_argument("path")
-    socket_parser.add_argument("action", choices=("status", "exec", "input-text", "key", "repl"))
+    socket_parser.add_argument(
+        "action",
+        choices=("status", "exec", "input-text", "key", "repl", "workflow"),
+    )
     socket_parser.add_argument("command", nargs="?")
 
     stdio_parser = subparsers.add_parser("stdio")
-    stdio_parser.add_argument("action", choices=("status", "exec", "input-text", "key", "repl"))
+    stdio_parser.add_argument(
+        "action",
+        choices=("status", "exec", "input-text", "key", "repl", "workflow"),
+    )
     stdio_parser.add_argument("command", nargs="?")
     stdio_parser.add_argument("spawn_command", nargs=argparse.REMAINDER)
 
@@ -301,9 +372,13 @@ def parse_args(argv):
         parser.error("input actions are socket-only")
     if args.action in ("input-text", "key") and not args.command:
         parser.error(f"{args.action} requires a value")
+    if args.action == "workflow" and not args.command:
+        parser.error("workflow requires a recipe path")
+    if args.transcript is not None and args.action != "workflow":
+        parser.error("--transcript can only be used with workflow")
 
     if args.transport == "stdio":
-        if args.action != "exec" and args.command is not None:
+        if args.action not in ("exec", "workflow") and args.command is not None:
             args.spawn_command = [args.command] + args.spawn_command
             args.command = None
         if args.spawn_command and args.spawn_command[0] == "--":

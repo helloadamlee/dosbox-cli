@@ -278,6 +278,71 @@ class HostControlClientTest(unittest.TestCase):
 
         self.assertEqual(args.timeout, 2.5)
 
+    def test_parse_workflow_recipe_accepts_supported_steps(self):
+        module = load_client_module()
+        recipe = {
+            "steps": [
+                {"comment": "mount"},
+                {"exec": "mount c /tmp/project"},
+                {"wait_for": {"event": "result", "ok": True}},
+                {"status": True},
+                {"input_text": "dir\n"},
+                {"key": "enter"},
+                {"wait_for": "input_result"},
+                {},
+            ]
+        }
+
+        steps = module.parse_workflow_recipe(recipe)
+
+        self.assertEqual(
+            [step.action for step in steps],
+            [
+                "comment",
+                "exec",
+                "wait_for",
+                "status",
+                "input_text",
+                "key",
+                "wait_for",
+                "noop",
+            ],
+        )
+        self.assertEqual(steps[1].value, "mount c /tmp/project")
+        self.assertEqual(steps[2].value, {"event": "result", "ok": True})
+
+    def test_parse_workflow_recipe_rejects_unknown_or_ambiguous_steps(self):
+        module = load_client_module()
+
+        with self.assertRaisesRegex(module.WorkflowError, "step 0: unknown action"):
+            module.parse_workflow_recipe({"steps": [{"sleep": 1}]})
+        with self.assertRaisesRegex(module.WorkflowError, "step 0: multiple actions"):
+            module.parse_workflow_recipe({"steps": [{"exec": "dir", "status": True}]})
+        with self.assertRaisesRegex(module.WorkflowError, "step 0: expected object"):
+            module.parse_workflow_recipe({"steps": ["exec dir"]})
+
+    def test_parse_args_accepts_workflow_and_transcript(self):
+        module = load_client_module()
+
+        args = module.parse_args(
+            [
+                "--timeout",
+                "2.5",
+                "--transcript",
+                "run.jsonl",
+                "socket",
+                "/tmp/d.sock",
+                "workflow",
+                "recipe.json",
+            ]
+        )
+
+        self.assertEqual(args.timeout, 2.5)
+        self.assertEqual(args.transcript, "run.jsonl")
+        self.assertEqual(args.transport, "socket")
+        self.assertEqual(args.action, "workflow")
+        self.assertEqual(args.command, "recipe.json")
+
     def test_parse_rejects_non_positive_timeout(self):
         proc = subprocess.run(
             [sys.executable, str(CLIENT), "--timeout", "0", "socket", "/tmp/d.sock", "status"],
