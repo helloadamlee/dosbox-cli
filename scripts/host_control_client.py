@@ -129,6 +129,14 @@ def wait_for_workflow_event(transport, matcher, timeout=None, recorder=None):
             return event
 
 
+def validate_workflow_for_transport(steps, allow_input):
+    if allow_input:
+        return
+    for index, step in enumerate(steps):
+        if step.action in ("input_text", "key"):
+            raise WorkflowError(f"step {index}: {step.action} actions are socket-only")
+
+
 def encode_request(request_id, op, command=None, text=None, key=None):
     payload = {"id": str(request_id), "op": op}
     if command is not None:
@@ -334,6 +342,7 @@ def run_request(
     key=None,
     timeout=None,
     recorder=None,
+    fail_on_error=False,
 ):
     deadline = make_deadline(timeout)
     transport.writeline(encode_request(request_id, op, command, text, key))
@@ -345,6 +354,10 @@ def run_request(
             recorder=recorder,
         )
         if event_completes_request(event, request_id, op):
+            if fail_on_error and event.get("event") == "error":
+                raise WorkflowError(
+                    f"server error for request {request_id}: {event.get('message', '')}"
+                )
             return 0
 
 
@@ -421,6 +434,7 @@ def run_workflow(transport, steps, timeout=None, allow_input=True, transcript=No
                     command=step.value,
                     timeout=timeout,
                     recorder=recorder,
+                    fail_on_error=True,
                 )
                 next_request_id += 1
             elif step.action == "status":
@@ -430,6 +444,7 @@ def run_workflow(transport, steps, timeout=None, allow_input=True, transcript=No
                     "status",
                     timeout=timeout,
                     recorder=recorder,
+                    fail_on_error=True,
                 )
                 next_request_id += 1
             elif step.action == "input_text":
@@ -442,6 +457,7 @@ def run_workflow(transport, steps, timeout=None, allow_input=True, transcript=No
                     text=step.value,
                     timeout=timeout,
                     recorder=recorder,
+                    fail_on_error=True,
                 )
                 next_request_id += 1
             elif step.action == "key":
@@ -454,6 +470,7 @@ def run_workflow(transport, steps, timeout=None, allow_input=True, transcript=No
                     key=step.value,
                     timeout=timeout,
                     recorder=recorder,
+                    fail_on_error=True,
                 )
                 next_request_id += 1
             elif step.action == "wait_for":
@@ -541,8 +558,16 @@ def make_transport(args):
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     workflow_steps = None
-    if args.action == "workflow":
-        workflow_steps = load_workflow_recipe(args.command)
+    try:
+        if args.action == "workflow":
+            workflow_steps = load_workflow_recipe(args.command)
+            validate_workflow_for_transport(
+                workflow_steps,
+                allow_input=args.transport == "socket",
+            )
+    except WorkflowError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     try:
         transport = make_transport(args)

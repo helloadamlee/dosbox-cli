@@ -518,6 +518,57 @@ class HostControlClientTest(unittest.TestCase):
             self.assertIn("timed out waiting for workflow event", proc.stderr)
             self.assertIn('"event":"output"', proc.stderr)
 
+    def test_socket_workflow_fails_on_matching_error_event(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            recipe_path = self._write_recipe(tmpdir, {"steps": [{"exec": "bad"}]})
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"error","id":"1","message":"failed"}\n',
+            ]
+            thread = self._serve_socket_workflow(sock_path, lines, requests, expected_requests=1)
+
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "socket", sock_path, "workflow", str(recipe_path)],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.join(timeout=2)
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertIn("workflow step 0 exec failed", proc.stderr)
+            self.assertIn("server error for request 1: failed", proc.stderr)
+
+    def test_stdio_workflow_rejects_input_actions_before_spawn(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            recipe_path = self._write_recipe(tmpdir, {"steps": [{"input_text": "dir\n"}]})
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLIENT),
+                    "stdio",
+                    "workflow",
+                    str(recipe_path),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "raise SystemExit('should not spawn')",
+                    "-control-stdio",
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("input_text actions are socket-only", proc.stderr)
+            self.assertNotIn("should not spawn", proc.stderr)
+
     def test_parse_rejects_non_positive_timeout(self):
         proc = subprocess.run(
             [sys.executable, str(CLIENT), "--timeout", "0", "socket", "/tmp/d.sock", "status"],
