@@ -26,6 +26,7 @@ class WorkflowStep:
 
 
 WORKFLOW_ACTIONS = {"comment", "exec", "status", "input_text", "key", "wait_for"}
+WAIT_EVENT_ALIASES = {"ready", "output", "result", "status", "error", "input_result"}
 
 
 def parse_workflow_recipe(recipe):
@@ -105,8 +106,27 @@ def format_workflow_failure(index, step, exc, recorder):
     return "\n".join(lines)
 
 
+def event_matches(event, matcher):
+    if isinstance(matcher, str):
+        if matcher not in WAIT_EVENT_ALIASES:
+            raise WorkflowError(f"unsupported wait_for event {matcher}")
+        return event.get("event") == matcher
+    if not isinstance(matcher, dict) or not matcher:
+        raise WorkflowError("wait_for object must not be empty")
+    return all(event.get(key) == value for key, value in matcher.items())
+
+
 def wait_for_workflow_event(transport, matcher, timeout=None, recorder=None):
-    raise WorkflowError("wait_for is not implemented yet")
+    deadline = make_deadline(timeout)
+    while True:
+        event = read_event_line(
+            transport,
+            deadline,
+            "workflow event",
+            recorder=recorder,
+        )
+        if event_matches(event, matcher):
+            return event
 
 
 def encode_request(request_id, op, command=None, text=None, key=None):

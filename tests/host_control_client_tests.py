@@ -77,6 +77,25 @@ class HostControlClientTest(unittest.TestCase):
         self.assertTrue(ready.wait(2.0))
         return thread
 
+    def _serve_socket_lines_then_hang(self, sock_path, response_lines):
+        ready = threading.Event()
+
+        def serve():
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(sock_path)
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn, server:
+                for line in response_lines:
+                    conn.sendall(line.encode("utf-8"))
+                threading.Event().wait(0.5)
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(2.0))
+        return thread
+
     def _serve_socket_workflow(self, sock_path, response_lines, requests, expected_requests):
         ready = threading.Event()
 
@@ -428,6 +447,76 @@ class HostControlClientTest(unittest.TestCase):
                     '{"id":"4","op":"key","key":"enter"}\n',
                 ],
             )
+
+    def test_socket_workflow_wait_for_matches_output_event(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            recipe_path = self._write_recipe(tmpdir, {"steps": [{"wait_for": "output"}]})
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"output","id":"99","encoding":"base64","data":"aGkNCg=="}\n',
+            ]
+            thread = self._serve_socket_workflow(sock_path, lines, requests, expected_requests=0)
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLIENT),
+                    "--timeout",
+                    "1",
+                    "socket",
+                    sock_path,
+                    "workflow",
+                    str(recipe_path),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.join(timeout=2)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertEqual(requests, [])
+
+    def test_socket_workflow_timeout_reports_step_and_recent_events(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            recipe_path = self._write_recipe(
+                tmpdir,
+                {"steps": [{"wait_for": {"event": "result", "ok": True}}]},
+            )
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"output","id":"1","encoding":"base64","data":"aGkNCg=="}\n',
+            ]
+            thread = self._serve_socket_lines_then_hang(sock_path, lines)
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLIENT),
+                    "--timeout",
+                    "0.1",
+                    "socket",
+                    sock_path,
+                    "workflow",
+                    str(recipe_path),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.join(timeout=2)
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertIn("workflow step 0 wait_for", proc.stderr)
+            self.assertIn("timed out waiting for workflow event", proc.stderr)
+            self.assertIn('"event":"output"', proc.stderr)
 
     def test_parse_rejects_non_positive_timeout(self):
         proc = subprocess.run(
