@@ -8,10 +8,142 @@ import socket
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 
 
 class RequestTimeout(RuntimeError):
     pass
+
+
+class WorkflowError(RuntimeError):
+    pass
+
+
+@dataclass
+class WorkflowStep:
+    action: str
+    value: object = None
+
+
+WORKFLOW_ACTIONS = {"comment", "exec", "status", "input_text", "key", "wait_for"}
+WAIT_EVENT_ALIASES = {"ready", "output", "result", "status", "error", "input_result"}
+
+
+def parse_workflow_recipe(recipe):
+    if not isinstance(recipe, dict):
+        raise WorkflowError("recipe: expected object")
+    steps = recipe.get("steps")
+    if not isinstance(steps, list):
+        raise WorkflowError("recipe.steps: expected array")
+
+    parsed = []
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            raise WorkflowError(f"step {index}: expected object")
+        if not step:
+            parsed.append(WorkflowStep("noop"))
+            continue
+
+        actions = [key for key in step if key in WORKFLOW_ACTIONS]
+        unknown = [key for key in step if key not in WORKFLOW_ACTIONS]
+        if unknown:
+            raise WorkflowError(f"step {index}: unknown action {unknown[0]}")
+        if len(actions) != 1:
+            raise WorkflowError(f"step {index}: multiple actions")
+
+        action = actions[0]
+        value = step[action]
+        if action == "comment":
+            if not isinstance(value, str):
+                raise WorkflowError(f"step {index}: comment must be a string")
+        elif action == "exec":
+            if not isinstance(value, str) or not value:
+                raise WorkflowError(f"step {index}: exec must be a non-empty string")
+        elif action == "status":
+            if value not in (True, None) and value != {}:
+                raise WorkflowError(f"step {index}: status must be true, null, or object")
+        elif action == "input_text":
+            if not isinstance(value, str):
+                raise WorkflowError(f"step {index}: input_text must be a string")
+        elif action == "key":
+            if not isinstance(value, str) or not value:
+                raise WorkflowError(f"step {index}: key must be a non-empty string")
+        elif action == "wait_for":
+            if not isinstance(value, (str, dict)):
+                raise WorkflowError(f"step {index}: wait_for must be a string or object")
+        parsed.append(WorkflowStep(action, value))
+    return parsed
+
+
+def load_workflow_recipe(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return parse_workflow_recipe(json.load(handle))
+    except OSError as exc:
+        raise WorkflowError(f"failed to read workflow recipe: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise WorkflowError(f"failed to parse workflow recipe: {exc}") from exc
+
+
+class EventRecorder:
+    def __init__(self, transcript=None, recent_limit=10):
+        self.recent = []
+        self.recent_limit = recent_limit
+        self.transcript = transcript
+
+    def record(self, raw_line, event):
+        raw_text = raw_line.decode("utf-8", errors="replace")
+        self.recent.append(raw_text)
+        if len(self.recent) > self.recent_limit:
+            self.recent = self.recent[-self.recent_limit:]
+        if self.transcript is not None:
+            self.transcript.write(
+                json.dumps(
+                    {"type": "event", "raw": raw_text, "event": event},
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            self.transcript.flush()
+
+
+def format_workflow_failure(index, step, exc, recorder):
+    lines = [f"workflow step {index} {step.action} failed: {exc}"]
+    if recorder.recent:
+        lines.append("recent events:")
+        lines.extend(line.rstrip("\r\n") for line in recorder.recent)
+    return "\n".join(lines)
+
+
+def event_matches(event, matcher):
+    if isinstance(matcher, str):
+        if matcher not in WAIT_EVENT_ALIASES:
+            raise WorkflowError(f"unsupported wait_for event {matcher}")
+        return event.get("event") == matcher
+    if not isinstance(matcher, dict) or not matcher:
+        raise WorkflowError("wait_for object must not be empty")
+    return all(event.get(key) == value for key, value in matcher.items())
+
+
+def wait_for_workflow_event(transport, matcher, timeout=None, recorder=None):
+    deadline = make_deadline(timeout)
+    while True:
+        event = read_event_line(
+            transport,
+            deadline,
+            "workflow event",
+            recorder=recorder,
+        )
+        if event_matches(event, matcher):
+            return event
+
+
+def validate_workflow_for_transport(steps, allow_input):
+    if allow_input:
+        return
+    for index, step in enumerate(steps):
+        if step.action in ("input_text", "key"):
+            raise WorkflowError(f"step {index}: {step.action} actions are socket-only")
 
 
 def encode_request(request_id, op, command=None, text=None, key=None):
@@ -189,7 +321,7 @@ def wait_for_readable(transport, deadline, description):
         raise RequestTimeout(f"timed out waiting for {description}")
 
 
-def read_event_line(transport, deadline=None, description="event"):
+def read_event_line(transport, deadline=None, description="event", recorder=None):
     while not transport.has_buffered_line():
         wait_for_readable(transport, deadline, description)
         if not transport.read_available():
@@ -202,17 +334,39 @@ def read_event_line(transport, deadline=None, description="event"):
     sys.stdout.flush()
     try:
         line = raw_line.decode("utf-8")
-        return json.loads(line)
+        event = json.loads(line)
+        if recorder is not None:
+            recorder.record(raw_line, event)
+        return event
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError("received invalid JSON event") from exc
 
 
-def run_request(transport, request_id, op, command=None, text=None, key=None, timeout=None):
+def run_request(
+    transport,
+    request_id,
+    op,
+    command=None,
+    text=None,
+    key=None,
+    timeout=None,
+    recorder=None,
+    fail_on_error=False,
+):
     deadline = make_deadline(timeout)
     transport.writeline(encode_request(request_id, op, command, text, key))
     while True:
-        event = read_event_line(transport, deadline, f"{op} request {request_id}")
+        event = read_event_line(
+            transport,
+            deadline,
+            f"{op} request {request_id}",
+            recorder=recorder,
+        )
         if event_completes_request(event, request_id, op):
+            if fail_on_error and event.get("event") == "error":
+                raise WorkflowError(
+                    f"server error for request {request_id}: {event.get('message', '')}"
+                )
             return 0
 
 
@@ -272,6 +426,76 @@ def run_repl(transport, timeout=None, allow_input=True):
         next_request_id += 1
 
 
+def run_workflow(transport, steps, timeout=None, allow_input=True, transcript=None):
+    recorder = EventRecorder(transcript=transcript)
+    read_event_line(transport, make_deadline(timeout), "ready event", recorder=recorder)
+    next_request_id = 1
+
+    for index, step in enumerate(steps):
+        if step.action in ("noop", "comment"):
+            continue
+        try:
+            if step.action == "exec":
+                run_request(
+                    transport,
+                    next_request_id,
+                    "exec",
+                    command=step.value,
+                    timeout=timeout,
+                    recorder=recorder,
+                    fail_on_error=True,
+                )
+                next_request_id += 1
+            elif step.action == "status":
+                run_request(
+                    transport,
+                    next_request_id,
+                    "status",
+                    timeout=timeout,
+                    recorder=recorder,
+                    fail_on_error=True,
+                )
+                next_request_id += 1
+            elif step.action == "input_text":
+                if not allow_input:
+                    raise WorkflowError("input_text actions are socket-only")
+                run_request(
+                    transport,
+                    next_request_id,
+                    "input_text",
+                    text=step.value,
+                    timeout=timeout,
+                    recorder=recorder,
+                    fail_on_error=True,
+                )
+                next_request_id += 1
+            elif step.action == "key":
+                if not allow_input:
+                    raise WorkflowError("key actions are socket-only")
+                run_request(
+                    transport,
+                    next_request_id,
+                    "key",
+                    key=step.value,
+                    timeout=timeout,
+                    recorder=recorder,
+                    fail_on_error=True,
+                )
+                next_request_id += 1
+            elif step.action == "wait_for":
+                wait_for_workflow_event(
+                    transport,
+                    step.value,
+                    timeout=timeout,
+                    recorder=recorder,
+                )
+        except RequestTimeout as exc:
+            raise RequestTimeout(format_workflow_failure(index, step, exc, recorder)) from exc
+        except RuntimeError as exc:
+            raise WorkflowError(format_workflow_failure(index, step, exc, recorder)) from exc
+    return 0
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -280,15 +504,26 @@ def parse_args(argv):
         default=None,
         help="seconds to wait for each host-control response",
     )
+    parser.add_argument(
+        "--transcript",
+        default=None,
+        help="write workflow events to a JSONL transcript",
+    )
     subparsers = parser.add_subparsers(dest="transport", required=True)
 
     socket_parser = subparsers.add_parser("socket")
     socket_parser.add_argument("path")
-    socket_parser.add_argument("action", choices=("status", "exec", "input-text", "key", "repl"))
+    socket_parser.add_argument(
+        "action",
+        choices=("status", "exec", "input-text", "key", "repl", "workflow"),
+    )
     socket_parser.add_argument("command", nargs="?")
 
     stdio_parser = subparsers.add_parser("stdio")
-    stdio_parser.add_argument("action", choices=("status", "exec", "input-text", "key", "repl"))
+    stdio_parser.add_argument(
+        "action",
+        choices=("status", "exec", "input-text", "key", "repl", "workflow"),
+    )
     stdio_parser.add_argument("command", nargs="?")
     stdio_parser.add_argument("spawn_command", nargs=argparse.REMAINDER)
 
@@ -301,9 +536,13 @@ def parse_args(argv):
         parser.error("input actions are socket-only")
     if args.action in ("input-text", "key") and not args.command:
         parser.error(f"{args.action} requires a value")
+    if args.action == "workflow" and not args.command:
+        parser.error("workflow requires a recipe path")
+    if args.transcript is not None and args.action != "workflow":
+        parser.error("--transcript can only be used with workflow")
 
     if args.transport == "stdio":
-        if args.action != "exec" and args.command is not None:
+        if args.action not in ("exec", "workflow") and args.command is not None:
             args.spawn_command = [args.command] + args.spawn_command
             args.command = None
         if args.spawn_command and args.spawn_command[0] == "--":
@@ -329,10 +568,29 @@ def make_transport(args):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    workflow_steps = None
+    transcript = None
+    try:
+        if args.action == "workflow":
+            workflow_steps = load_workflow_recipe(args.command)
+            validate_workflow_for_transport(
+                workflow_steps,
+                allow_input=args.transport == "socket",
+            )
+            if args.transcript is not None:
+                transcript = open(args.transcript, "w", encoding="utf-8")
+    except WorkflowError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"failed to open transcript: {exc}", file=sys.stderr)
+        return 1
 
     try:
         transport = make_transport(args)
     except OSError as exc:
+        if transcript is not None:
+            transcript.close()
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -340,6 +598,14 @@ def main(argv=None):
     try:
         if args.action == "repl":
             return run_repl(transport, args.timeout, allow_input=args.transport == "socket")
+        if args.action == "workflow":
+            return run_workflow(
+                transport,
+                workflow_steps,
+                args.timeout,
+                allow_input=args.transport == "socket",
+                transcript=transcript,
+            )
         if args.action == "input-text":
             return run_one_shot(transport, "input_text", text=args.command, timeout=args.timeout)
         if args.action == "key":
@@ -356,6 +622,8 @@ def main(argv=None):
     finally:
         if not aborted:
             transport.close()
+        if transcript is not None:
+            transcript.close()
 
 
 if __name__ == "__main__":
