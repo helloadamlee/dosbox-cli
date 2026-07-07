@@ -31,6 +31,43 @@ std::string make_temp_socket_path()
 	EXPECT_NE(dir, nullptr);
 	return std::string(dir ? dir : "/tmp") + "/control.sock";
 }
+
+class SocketSessionTestCleanup {
+public:
+	SocketSessionTestCleanup(std::promise<void> &finish_promise, int &client_fd, std::thread &thread)
+	        : allow_exec_finish(finish_promise),
+	          client_fd(client_fd),
+	          server(thread)
+	{}
+
+	~SocketSessionTestCleanup()
+	{
+		release_exec();
+		if (client_fd >= 0) {
+			(void)shutdown(client_fd, SHUT_RDWR);
+			(void)close(client_fd);
+			client_fd = -1;
+		}
+		if (server.joinable()) {
+			server.join();
+		}
+		host_control::clear_queued_input();
+	}
+
+	void release_exec()
+	{
+		if (!released) {
+			allow_exec_finish.set_value();
+			released = true;
+		}
+	}
+
+private:
+	std::promise<void> &allow_exec_finish;
+	int &client_fd;
+	std::thread &server;
+	bool released = false;
+};
 #endif
 
 class ScopedHostControlDosState {
@@ -888,8 +925,10 @@ TEST(HostControlProtocolTest, SocketSessionAcceptsInputWhileExecIsRunning)
 	std::promise<void> allow_exec_finish;
 	auto exec_started_future = exec_started.get_future();
 	auto allow_exec_finish_future = allow_exec_finish.get_future();
+	std::thread server;
+	SocketSessionTestCleanup cleanup(allow_exec_finish, fds[1], server);
 
-	std::thread server([&]() {
+	server = std::thread([&]() {
 		(void)host_control::run_control_socket_session(
 		        {host_control::Transport::Socket, "/tmp/test.sock"},
 		        fds[0],
@@ -936,14 +975,73 @@ TEST(HostControlProtocolTest, SocketSessionAcceptsInputWhileExecIsRunning)
 	EXPECT_NE(line.find(R"("event":"input_result")"), std::string::npos);
 	EXPECT_NE(line.find(R"("id":"2")"), std::string::npos);
 
-	allow_exec_finish.set_value();
+	cleanup.release_exec();
 	ASSERT_TRUE(read_line(line));
 	EXPECT_NE(line.find(R"("event":"result")"), std::string::npos);
 	EXPECT_NE(line.find(R"("id":"1")"), std::string::npos);
+}
 
-	close(fds[1]);
-	server.join();
+TEST(HostControlProtocolTest, SocketSessionDisconnectDuringExecDoesNotEmitResult)
+{
 	host_control::clear_queued_input();
+	int fds[2] = {-1, -1};
+	ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+	std::promise<void> exec_started;
+	std::promise<void> allow_exec_finish;
+	auto exec_started_future = exec_started.get_future();
+	auto allow_exec_finish_future = allow_exec_finish.get_future();
+	host_control::SessionResult session = {};
+	std::thread server;
+	SocketSessionTestCleanup cleanup(allow_exec_finish, fds[1], server);
+
+	server = std::thread([&]() {
+		session = host_control::run_control_socket_session(
+		        {host_control::Transport::Socket, "/tmp/test.sock"},
+		        fds[0],
+		        [&](const host_control::Request &, host_control::CommandResult &result) {
+			        exec_started.set_value();
+			        allow_exec_finish_future.wait();
+			        result.shell_exit = false;
+			        result.errorlevel = 0;
+			        result.drive = "Z";
+			        result.cwd = "Z:\\";
+			        return true;
+		        });
+	});
+
+	auto read_line = [&](std::string &line) {
+		line.clear();
+		for (;;) {
+			char byte = 0;
+			const auto received = read(fds[1], &byte, 1);
+			if (received <= 0) {
+				return false;
+			}
+			if (byte == '\n') {
+				return true;
+			}
+			line += byte;
+		}
+	};
+
+	std::string line = {};
+	ASSERT_TRUE(read_line(line));
+	EXPECT_NE(line.find(R"("event":"ready")"), std::string::npos);
+
+	const std::string exec_request = R"({"id":"1","op":"exec","command":"hang"})" "\n";
+	ASSERT_EQ(write(fds[1], exec_request.data(), exec_request.size()),
+	          static_cast<ssize_t>(exec_request.size()));
+	ASSERT_EQ(exec_started_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+
+	ASSERT_EQ(shutdown(fds[1], SHUT_WR), 0);
+	cleanup.release_exec();
+	ASSERT_FALSE(read_line(line)) << line;
+	if (server.joinable()) {
+		server.join();
+	}
+	EXPECT_TRUE(session.started);
+	EXPECT_FALSE(session.had_io_error);
 }
 
 TEST(HostControlProtocolTest, SocketServerRejectsEmptyEndpoint)

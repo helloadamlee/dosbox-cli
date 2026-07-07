@@ -180,7 +180,6 @@ void close_fd(int &fd)
 }
 
 struct SocketSessionState {
-	Options options = {};
 	int client_fd = -1;
 	std::mutex mutex = {};
 	std::condition_variable condition = {};
@@ -261,6 +260,12 @@ void socket_session_reader(SocketSessionState &state)
 		}
 		state.condition.notify_all();
 	}
+}
+
+bool is_socket_session_disconnected(SocketSessionState &state)
+{
+	std::lock_guard<std::mutex> lock(state.mutex);
+	return state.disconnected;
 }
 #else
 bool read_stdin_line(std::string &line)
@@ -423,7 +428,6 @@ SessionResult run_control_socket_session(const Options &options,
 	return result;
 #else
 	SocketSessionState state = {};
-	state.options = options;
 	state.client_fd = client_fd;
 
 	active_write_line = [&state](const std::string &line) {
@@ -451,11 +455,12 @@ SessionResult run_control_socket_session(const Options &options,
 			state.condition.wait(lock, [&state]() {
 				return !state.requests.empty() || state.disconnected;
 			});
+			if (state.disconnected) {
+				break;
+			}
 			if (!state.requests.empty()) {
 				request = state.requests.front();
 				state.requests.pop_front();
-			} else if (state.disconnected) {
-				break;
 			}
 		}
 
@@ -482,6 +487,10 @@ SessionResult run_control_socket_session(const Options &options,
 		const bool ok = exec_request(request, command_result);
 		const auto end_ms = get_monotonic_ms();
 		command_result.duration_ms = end_ms >= start_ms ? (end_ms - start_ms) : 0;
+		if (is_socket_session_disconnected(state)) {
+			active_request_id.clear();
+			break;
+		}
 		if (session_write_failed.load() ||
 		    !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
 			result.had_io_error = true;
@@ -499,7 +508,8 @@ SessionResult run_control_socket_session(const Options &options,
 		}
 	}
 
-	if (!result.had_io_error && !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
+	if (!result.had_io_error && !is_socket_session_disconnected(state) &&
+	    !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
 		result.had_io_error = true;
 	}
 
