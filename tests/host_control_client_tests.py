@@ -569,6 +569,46 @@ class HostControlClientTest(unittest.TestCase):
             self.assertIn("input_text actions are socket-only", proc.stderr)
             self.assertNotIn("should not spawn", proc.stderr)
 
+    def test_socket_workflow_writes_jsonl_transcript_without_changing_stdout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            recipe_path = self._write_recipe(tmpdir, {"steps": [{"status": True}]})
+            transcript_path = Path(tmpdir) / "run.jsonl"
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"status","id":"1","transport":"socket","session_active":true,"errorlevel":0,"drive":"Z","cwd":"Z:\\\\"}\n',
+            ]
+            thread = self._serve_socket_workflow(sock_path, lines, requests, expected_requests=1)
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLIENT),
+                    "--transcript",
+                    str(transcript_path),
+                    "socket",
+                    sock_path,
+                    "workflow",
+                    str(recipe_path),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.join(timeout=2)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "".join(lines))
+            entries = [
+                json.loads(line)
+                for line in transcript_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual([entry["type"] for entry in entries], ["event", "event"])
+            self.assertEqual(entries[0]["raw"], lines[0])
+            self.assertEqual(entries[1]["event"]["event"], "status")
+
     def test_parse_rejects_non_positive_timeout(self):
         proc = subprocess.run(
             [sys.executable, str(CLIENT), "--timeout", "0", "socket", "/tmp/d.sock", "status"],

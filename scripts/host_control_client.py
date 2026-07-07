@@ -96,6 +96,15 @@ class EventRecorder:
         self.recent.append(raw_text)
         if len(self.recent) > self.recent_limit:
             self.recent = self.recent[-self.recent_limit:]
+        if self.transcript is not None:
+            self.transcript.write(
+                json.dumps(
+                    {"type": "event", "raw": raw_text, "event": event},
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            self.transcript.flush()
 
 
 def format_workflow_failure(index, step, exc, recorder):
@@ -558,6 +567,7 @@ def make_transport(args):
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     workflow_steps = None
+    transcript = None
     try:
         if args.action == "workflow":
             workflow_steps = load_workflow_recipe(args.command)
@@ -565,13 +575,20 @@ def main(argv=None):
                 workflow_steps,
                 allow_input=args.transport == "socket",
             )
+            if args.transcript is not None:
+                transcript = open(args.transcript, "w", encoding="utf-8")
     except WorkflowError as exc:
         print(str(exc), file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"failed to open transcript: {exc}", file=sys.stderr)
         return 1
 
     try:
         transport = make_transport(args)
     except OSError as exc:
+        if transcript is not None:
+            transcript.close()
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -585,6 +602,7 @@ def main(argv=None):
                 workflow_steps,
                 args.timeout,
                 allow_input=args.transport == "socket",
+                transcript=transcript,
             )
         if args.action == "input-text":
             return run_one_shot(transport, "input_text", text=args.command, timeout=args.timeout)
@@ -602,6 +620,8 @@ def main(argv=None):
     finally:
         if not aborted:
             transport.close()
+        if transcript is not None:
+            transcript.close()
 
 
 if __name__ == "__main__":
