@@ -267,6 +267,41 @@ bool is_socket_session_disconnected(SocketSessionState &state)
 	std::lock_guard<std::mutex> lock(state.mutex);
 	return state.disconnected;
 }
+
+bool mark_socket_session_disconnected(SocketSessionState &state, const bool had_io_error)
+{
+	std::lock_guard<std::mutex> lock(state.mutex);
+	state.disconnected = true;
+	state.had_io_error = state.had_io_error || had_io_error;
+	state.condition.notify_all();
+	return true;
+}
+
+bool is_socket_would_block_error(const int error)
+{
+#if EAGAIN == EWOULDBLOCK
+	return error == EAGAIN;
+#else
+	return error == EAGAIN || error == EWOULDBLOCK;
+#endif
+}
+
+bool has_socket_session_peer_disconnected(SocketSessionState &state)
+{
+	char byte = 0;
+	const auto received = recv(state.client_fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+	if (received == 0) {
+		return mark_socket_session_disconnected(state, false);
+	}
+	if (received > 0) {
+		return false;
+	}
+	if (is_socket_would_block_error(errno) || errno == EINTR) {
+		return is_socket_session_disconnected(state);
+	}
+
+	return mark_socket_session_disconnected(state, true);
+}
 #else
 bool read_stdin_line(std::string &line)
 {
@@ -464,6 +499,10 @@ SessionResult run_control_socket_session(const Options &options,
 			}
 		}
 
+		if (has_socket_session_peer_disconnected(state)) {
+			break;
+		}
+
 		if (request.op == "status") {
 			if (!emit_session_line(make_status_json_line(request.id, snapshot_status(options)))) {
 				result.had_io_error = true;
@@ -487,7 +526,7 @@ SessionResult run_control_socket_session(const Options &options,
 		const bool ok = exec_request(request, command_result);
 		const auto end_ms = get_monotonic_ms();
 		command_result.duration_ms = end_ms >= start_ms ? (end_ms - start_ms) : 0;
-		if (is_socket_session_disconnected(state)) {
+		if (has_socket_session_peer_disconnected(state)) {
 			active_request_id.clear();
 			break;
 		}
@@ -508,7 +547,7 @@ SessionResult run_control_socket_session(const Options &options,
 		}
 	}
 
-	if (!result.had_io_error && !is_socket_session_disconnected(state) &&
+	if (!result.had_io_error && !has_socket_session_peer_disconnected(state) &&
 	    !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
 		result.had_io_error = true;
 	}
