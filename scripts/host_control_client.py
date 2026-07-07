@@ -462,73 +462,161 @@ def run_repl(transport, timeout=None, allow_input=True):
         next_request_id += 1
 
 
-def run_workflow(transport, steps, timeout=None, allow_input=True, transcript=None):
-    recorder = EventRecorder(transcript=transcript)
-    read_event_line(transport, make_deadline(timeout), "ready event", recorder=recorder)
-    next_request_id = 1
+class WorkflowRuntime:
+    def __init__(self, transport, timeout=None, allow_input=True, transcript=None):
+        self.transport = transport
+        self.timeout = timeout
+        self.allow_input = allow_input
+        self.recorder = EventRecorder(transcript=transcript)
+        self.next_request_id = 1
+        self.request_ops = {}
+        self.completed_requests = {}
+        self.pending_events = []
 
-    for index, step in enumerate(steps):
+    def read_event(self, description):
+        event = read_event_line(
+            self.transport,
+            make_deadline(self.timeout),
+            description,
+            recorder=self.recorder,
+        )
+        self.remember_completion(event)
+        return event
+
+    def remember_completion(self, event):
+        request_id = str(event.get("id", ""))
+        op = self.request_ops.get(request_id)
+        if op is not None and event_completes_request(event, request_id, op):
+            self.completed_requests[request_id] = event
+
+    def send_request(self, op, command=None, text=None, key=None):
+        request_id = str(self.next_request_id)
+        self.next_request_id += 1
+        self.request_ops[request_id] = op
+        self.transport.writeline(encode_request(request_id, op, command, text, key))
+        return request_id
+
+    def wait_for_request(self, request_id, fail_on_error=True):
+        request_id = str(request_id)
+        if request_id in self.completed_requests:
+            event = self.completed_requests[request_id]
+            if fail_on_error and event.get("event") == "error":
+                raise WorkflowError(
+                    f"server error for request {request_id}: {event.get('message', '')}"
+                )
+            return event
+
+        op = self.request_ops[request_id]
+        remaining_pending = []
+        for event in self.pending_events:
+            if event_completes_request(event, request_id, op):
+                self.completed_requests[request_id] = event
+            else:
+                remaining_pending.append(event)
+        self.pending_events = remaining_pending
+
+        if request_id in self.completed_requests:
+            event = self.completed_requests[request_id]
+            if fail_on_error and event.get("event") == "error":
+                raise WorkflowError(
+                    f"server error for request {request_id}: {event.get('message', '')}"
+                )
+            return event
+
+        while True:
+            event = self.read_event(f"{op} request {request_id}")
+            if event_completes_request(event, request_id, op):
+                if fail_on_error and event.get("event") == "error":
+                    raise WorkflowError(
+                        f"server error for request {request_id}: {event.get('message', '')}"
+                    )
+                return event
+            self.pending_events.append(event)
+
+    def run_request(self, op, command=None, text=None, key=None):
+        request_id = self.send_request(op, command=command, text=text, key=key)
+        self.wait_for_request(request_id)
+        return request_id
+
+    def wait_for_event(self, matcher):
+        remaining_pending = []
+        matched = None
+        for event in self.pending_events:
+            if matched is None and event_matches(event, matcher):
+                matched = event
+            else:
+                remaining_pending.append(event)
+        self.pending_events = remaining_pending
+        if matched is not None:
+            return matched
+
+        while True:
+            event = self.read_event("workflow event")
+            if event_matches(event, matcher):
+                return event
+            self.pending_events.append(event)
+
+    def run_steps(self, steps, context_prefix="workflow step"):
+        for index, step in enumerate(steps):
+            step_context = f"{context_prefix} {index}"
+            self.run_step(step, step_context)
+
+    def run_step(self, step, step_context):
         if step.action in ("noop", "comment"):
-            continue
+            return
         try:
             if step.action == "exec":
-                run_request(
-                    transport,
-                    next_request_id,
-                    "exec",
-                    command=step.value,
-                    timeout=timeout,
-                    recorder=recorder,
-                    fail_on_error=True,
-                )
-                next_request_id += 1
+                self.run_request("exec", command=step.value)
             elif step.action == "status":
-                run_request(
-                    transport,
-                    next_request_id,
-                    "status",
-                    timeout=timeout,
-                    recorder=recorder,
-                    fail_on_error=True,
-                )
-                next_request_id += 1
+                self.run_request("status")
             elif step.action == "input_text":
-                if not allow_input:
+                if not self.allow_input:
                     raise WorkflowError("input_text actions are socket-only")
-                run_request(
-                    transport,
-                    next_request_id,
-                    "input_text",
-                    text=step.value,
-                    timeout=timeout,
-                    recorder=recorder,
-                    fail_on_error=True,
-                )
-                next_request_id += 1
+                self.run_request("input_text", text=step.value)
             elif step.action == "key":
-                if not allow_input:
+                if not self.allow_input:
                     raise WorkflowError("key actions are socket-only")
-                run_request(
-                    transport,
-                    next_request_id,
-                    "key",
-                    key=step.value,
-                    timeout=timeout,
-                    recorder=recorder,
-                    fail_on_error=True,
-                )
-                next_request_id += 1
+                self.run_request("key", key=step.value)
             elif step.action == "wait_for":
-                wait_for_workflow_event(
-                    transport,
-                    step.value,
-                    timeout=timeout,
-                    recorder=recorder,
-                )
+                self.wait_for_event(step.value)
+            elif step.action == "exec_interactive":
+                self.run_exec_interactive(step)
         except RequestTimeout as exc:
-            raise RequestTimeout(format_workflow_failure(index, step, exc, recorder)) from exc
+            raise RequestTimeout(
+                self.format_failure(step_context, step.action, exc)
+            ) from exc
         except RuntimeError as exc:
-            raise WorkflowError(format_workflow_failure(index, step, exc, recorder)) from exc
+            raise WorkflowError(
+                self.format_failure(step_context, step.action, exc)
+            ) from exc
+
+    def run_exec_interactive(self, step):
+        if not self.allow_input:
+            raise WorkflowError("exec_interactive actions are socket-only")
+        request_id = self.send_request("exec", command=step.value["command"])
+        self.run_steps(
+            step.value["steps"],
+            context_prefix="workflow step 0 exec_interactive nested step",
+        )
+        self.wait_for_request(request_id)
+
+    def format_failure(self, step_context, action, exc):
+        lines = [f"{step_context} {action} failed: {exc}"]
+        if self.recorder.recent:
+            lines.append("recent events:")
+            lines.extend(line.rstrip("\r\n") for line in self.recorder.recent)
+        return "\n".join(lines)
+
+
+def run_workflow(transport, steps, timeout=None, allow_input=True, transcript=None):
+    runtime = WorkflowRuntime(
+        transport,
+        timeout=timeout,
+        allow_input=allow_input,
+        transcript=transcript,
+    )
+    runtime.read_event("ready event")
+    runtime.run_steps(steps)
     return 0
 
 
