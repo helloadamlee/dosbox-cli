@@ -47,6 +47,23 @@ Query current host-control state:
 {"id":"2","op":"status"}
 ```
 
+Queue printable ASCII text for DOS keyboard input:
+
+```json
+{"id":"7","op":"input_text","text":"dir\r"}
+```
+
+Queue a named key:
+
+```json
+{"id":"8","op":"key","key":"enter"}
+```
+
+`input_text` and `key` are socket-only in Milestone 4. `input_text` accepts
+printable ASCII; `\r` and `\n` are normalized to Enter. Non-ASCII text is
+rejected. Supported keys are `enter`, `escape`, `tab`, `backspace`, `up`,
+`down`, `left`, and `right`.
+
 Request ids are caller-defined strings. The included client uses monotonically
 increasing ids starting at `1`.
 
@@ -76,6 +93,16 @@ Completed `status` requests emit `status`:
 {"event":"status","id":"2","transport":"socket","session_active":true,"errorlevel":0,"drive":"Z","cwd":"Z:\\"}
 ```
 
+Completed `input_text` and `key` requests emit `input_result`:
+
+```json
+{"event":"input_result","id":"7","ok":true,"queued":4}
+```
+
+`queued` is the number of BIOS keyboard-buffer entries accepted into the
+host-control input queue. Completion means input was accepted by DOSBox-X, not
+that the guest has processed it.
+
 Malformed or unsupported requests emit `error`:
 
 ```json
@@ -92,6 +119,8 @@ The repository includes a small Python 3 stdlib client:
 ```bash
 scripts/host_control_client.py socket /tmp/dosboxx.sock status
 scripts/host_control_client.py socket /tmp/dosboxx.sock exec "echo hi"
+scripts/host_control_client.py socket /tmp/dosboxx.sock input-text $'dir\n'
+scripts/host_control_client.py socket /tmp/dosboxx.sock key enter
 scripts/host_control_client.py socket /tmp/dosboxx.sock repl
 ```
 
@@ -114,8 +143,9 @@ scripts/host_control_client.py --timeout 5 stdio status -- ./src/dosbox-x -contr
 
 Timeouts are a client-side recovery feature. In stdio mode, the client owns the
 spawned DOSBox-X process and terminates it on timeout. In socket mode, the client
-closes its socket; DOSBox-X may continue the current DOS command until it returns
-because requests currently execute synchronously.
+closes its socket; DOSBox-X may continue the current DOS command until it
+returns. Socket input requests remain responsive while an `exec` request is
+running.
 
 The client writes raw JSON events to stdout. REPL prompts and local help are
 written to stderr so stdout remains machine-readable.
@@ -124,6 +154,8 @@ REPL commands:
 
 - `status`
 - `exec <command>`
+- `input <text>`
+- `key <name>`
 - `help`
 - `quit`
 
@@ -134,5 +166,6 @@ Current host control is intentionally small:
 - one control client per socket session
 - no reconnect loop
 - no server-side command cancellation
-- no input injection for interactive DOS programs
+- input injection is socket-only and limited to printable ASCII text plus a small
+  named-key set
 - no pipe transport implementation
