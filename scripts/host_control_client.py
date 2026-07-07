@@ -74,6 +74,41 @@ def parse_workflow_recipe(recipe):
     return parsed
 
 
+def load_workflow_recipe(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return parse_workflow_recipe(json.load(handle))
+    except OSError as exc:
+        raise WorkflowError(f"failed to read workflow recipe: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise WorkflowError(f"failed to parse workflow recipe: {exc}") from exc
+
+
+class EventRecorder:
+    def __init__(self, transcript=None, recent_limit=10):
+        self.recent = []
+        self.recent_limit = recent_limit
+        self.transcript = transcript
+
+    def record(self, raw_line, event):
+        raw_text = raw_line.decode("utf-8", errors="replace")
+        self.recent.append(raw_text)
+        if len(self.recent) > self.recent_limit:
+            self.recent = self.recent[-self.recent_limit:]
+
+
+def format_workflow_failure(index, step, exc, recorder):
+    lines = [f"workflow step {index} {step.action} failed: {exc}"]
+    if recorder.recent:
+        lines.append("recent events:")
+        lines.extend(line.rstrip("\r\n") for line in recorder.recent)
+    return "\n".join(lines)
+
+
+def wait_for_workflow_event(transport, matcher, timeout=None, recorder=None):
+    raise WorkflowError("wait_for is not implemented yet")
+
+
 def encode_request(request_id, op, command=None, text=None, key=None):
     payload = {"id": str(request_id), "op": op}
     if command is not None:
@@ -249,7 +284,7 @@ def wait_for_readable(transport, deadline, description):
         raise RequestTimeout(f"timed out waiting for {description}")
 
 
-def read_event_line(transport, deadline=None, description="event"):
+def read_event_line(transport, deadline=None, description="event", recorder=None):
     while not transport.has_buffered_line():
         wait_for_readable(transport, deadline, description)
         if not transport.read_available():
@@ -262,16 +297,33 @@ def read_event_line(transport, deadline=None, description="event"):
     sys.stdout.flush()
     try:
         line = raw_line.decode("utf-8")
-        return json.loads(line)
+        event = json.loads(line)
+        if recorder is not None:
+            recorder.record(raw_line, event)
+        return event
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError("received invalid JSON event") from exc
 
 
-def run_request(transport, request_id, op, command=None, text=None, key=None, timeout=None):
+def run_request(
+    transport,
+    request_id,
+    op,
+    command=None,
+    text=None,
+    key=None,
+    timeout=None,
+    recorder=None,
+):
     deadline = make_deadline(timeout)
     transport.writeline(encode_request(request_id, op, command, text, key))
     while True:
-        event = read_event_line(transport, deadline, f"{op} request {request_id}")
+        event = read_event_line(
+            transport,
+            deadline,
+            f"{op} request {request_id}",
+            recorder=recorder,
+        )
         if event_completes_request(event, request_id, op):
             return 0
 
@@ -330,6 +382,70 @@ def run_repl(transport, timeout=None, allow_input=True):
         else:
             run_request(transport, next_request_id, op, command=command, timeout=timeout)
         next_request_id += 1
+
+
+def run_workflow(transport, steps, timeout=None, allow_input=True, transcript=None):
+    recorder = EventRecorder(transcript=transcript)
+    read_event_line(transport, make_deadline(timeout), "ready event", recorder=recorder)
+    next_request_id = 1
+
+    for index, step in enumerate(steps):
+        if step.action in ("noop", "comment"):
+            continue
+        try:
+            if step.action == "exec":
+                run_request(
+                    transport,
+                    next_request_id,
+                    "exec",
+                    command=step.value,
+                    timeout=timeout,
+                    recorder=recorder,
+                )
+                next_request_id += 1
+            elif step.action == "status":
+                run_request(
+                    transport,
+                    next_request_id,
+                    "status",
+                    timeout=timeout,
+                    recorder=recorder,
+                )
+                next_request_id += 1
+            elif step.action == "input_text":
+                if not allow_input:
+                    raise WorkflowError("input_text actions are socket-only")
+                run_request(
+                    transport,
+                    next_request_id,
+                    "input_text",
+                    text=step.value,
+                    timeout=timeout,
+                    recorder=recorder,
+                )
+                next_request_id += 1
+            elif step.action == "key":
+                if not allow_input:
+                    raise WorkflowError("key actions are socket-only")
+                run_request(
+                    transport,
+                    next_request_id,
+                    "key",
+                    key=step.value,
+                    timeout=timeout,
+                    recorder=recorder,
+                )
+                next_request_id += 1
+            elif step.action == "wait_for":
+                wait_for_workflow_event(
+                    transport,
+                    step.value,
+                    timeout=timeout,
+                    recorder=recorder,
+                )
+        except (RequestTimeout, RuntimeError, WorkflowError) as exc:
+            raise WorkflowError(format_workflow_failure(index, step, exc, recorder)) from exc
+    return 0
 
 
 def parse_args(argv):
@@ -404,6 +520,9 @@ def make_transport(args):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    workflow_steps = None
+    if args.action == "workflow":
+        workflow_steps = load_workflow_recipe(args.command)
 
     try:
         transport = make_transport(args)
@@ -415,6 +534,13 @@ def main(argv=None):
     try:
         if args.action == "repl":
             return run_repl(transport, args.timeout, allow_input=args.transport == "socket")
+        if args.action == "workflow":
+            return run_workflow(
+                transport,
+                workflow_steps,
+                args.timeout,
+                allow_input=args.transport == "socket",
+            )
         if args.action == "input-text":
             return run_one_shot(transport, "input_text", text=args.command, timeout=args.timeout)
         if args.action == "key":

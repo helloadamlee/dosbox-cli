@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 import os
 import signal
 import socket
@@ -75,6 +76,44 @@ class HostControlClientTest(unittest.TestCase):
         thread.start()
         self.assertTrue(ready.wait(2.0))
         return thread
+
+    def _serve_socket_workflow(self, sock_path, response_lines, requests, expected_requests):
+        ready = threading.Event()
+
+        def serve():
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(sock_path)
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn, server:
+                self.assertGreaterEqual(len(response_lines), 1)
+                conn.sendall(response_lines[0].encode("utf-8"))
+                next_response = 1
+                for _ in range(expected_requests):
+                    data = b""
+                    while not data.endswith(b"\n"):
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        data += chunk
+                    requests.append(data.decode("utf-8"))
+                    if next_response < len(response_lines):
+                        conn.sendall(response_lines[next_response].encode("utf-8"))
+                        next_response += 1
+                while next_response < len(response_lines):
+                    conn.sendall(response_lines[next_response].encode("utf-8"))
+                    next_response += 1
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(2.0))
+        return thread
+
+    def _write_recipe(self, tmpdir, recipe):
+        path = Path(tmpdir) / "recipe.json"
+        path.write_text(json.dumps(recipe), encoding="utf-8")
+        return path
 
     def test_socket_status_one_shot_preserves_raw_lines(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -342,6 +381,53 @@ class HostControlClientTest(unittest.TestCase):
         self.assertEqual(args.transport, "socket")
         self.assertEqual(args.action, "workflow")
         self.assertEqual(args.command, "recipe.json")
+
+    def test_socket_workflow_runs_requests_in_sequence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            recipe_path = self._write_recipe(
+                tmpdir,
+                {
+                    "steps": [
+                        {"comment": "run dir"},
+                        {"exec": "dir"},
+                        {"status": True},
+                        {"input_text": "dir\n"},
+                        {"key": "enter"},
+                        {},
+                    ]
+                },
+            )
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"result","id":"1","ok":true,"shell_exit":false,"errorlevel":0,"drive":"Z","cwd":"Z:\\\\","duration_ms":1}\n',
+                '{"event":"status","id":"2","transport":"socket","session_active":true,"errorlevel":0,"drive":"Z","cwd":"Z:\\\\"}\n',
+                '{"event":"input_result","id":"3","ok":true,"queued":4}\n',
+                '{"event":"input_result","id":"4","ok":true,"queued":1}\n',
+            ]
+            thread = self._serve_socket_workflow(sock_path, lines, requests, expected_requests=4)
+
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "socket", sock_path, "workflow", str(recipe_path)],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.join(timeout=2)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertEqual(
+                requests,
+                [
+                    '{"id":"1","op":"exec","command":"dir"}\n',
+                    '{"id":"2","op":"status"}\n',
+                    '{"id":"3","op":"input_text","text":"dir\\n"}\n',
+                    '{"id":"4","op":"key","key":"enter"}\n',
+                ],
+            )
 
     def test_parse_rejects_non_positive_timeout(self):
         proc = subprocess.run(
