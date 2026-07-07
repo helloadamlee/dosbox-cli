@@ -580,9 +580,17 @@ class WorkflowRuntime:
             elif step.action == "wait_for":
                 self.wait_for_event(step.value)
             elif step.action == "exec_interactive":
-                self.run_exec_interactive(step)
+                self.run_exec_interactive(step, step_context)
         except RequestTimeout as exc:
+            if str(exc).startswith("workflow step "):
+                raise
             raise RequestTimeout(
+                self.format_failure(step_context, step.action, exc)
+            ) from exc
+        except WorkflowError as exc:
+            if str(exc).startswith("workflow step "):
+                raise
+            raise WorkflowError(
                 self.format_failure(step_context, step.action, exc)
             ) from exc
         except RuntimeError as exc:
@@ -590,13 +598,13 @@ class WorkflowRuntime:
                 self.format_failure(step_context, step.action, exc)
             ) from exc
 
-    def run_exec_interactive(self, step):
+    def run_exec_interactive(self, step, step_context):
         if not self.allow_input:
             raise WorkflowError("exec_interactive actions are socket-only")
         request_id = self.send_request("exec", command=step.value["command"])
         self.run_steps(
             step.value["steps"],
-            context_prefix="workflow step 0 exec_interactive nested step",
+            context_prefix=f"{step_context} exec_interactive nested step",
         )
         self.wait_for_request(request_id)
 
