@@ -489,7 +489,9 @@ def run_workflow(transport, steps, timeout=None, allow_input=True, transcript=No
                     timeout=timeout,
                     recorder=recorder,
                 )
-        except (RequestTimeout, RuntimeError, WorkflowError) as exc:
+        except RequestTimeout as exc:
+            raise RequestTimeout(format_workflow_failure(index, step, exc, recorder)) from exc
+        except RuntimeError as exc:
             raise WorkflowError(format_workflow_failure(index, step, exc, recorder)) from exc
     return 0
 

@@ -733,6 +733,79 @@ class HostControlClientTest(unittest.TestCase):
             self.assertIn("timed out waiting for status request 1", proc.stderr)
             self.assertEqual(marker.read_text(), "terminated")
 
+    def test_stdio_workflow_timeout_terminates_spawned_child_promptly(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            marker = Path(tmpdir) / "marker"
+            pidfile = Path(tmpdir) / "child.pid"
+            recipe_path = self._write_recipe(
+                tmpdir,
+                {"steps": [{"wait_for": "result"}]},
+            )
+            stub = textwrap.dedent(
+                f"""
+                import os
+                import pathlib
+                import signal
+                import sys
+                import time
+
+                marker = pathlib.Path({str(marker)!r})
+                pidfile = pathlib.Path({str(pidfile)!r})
+                pidfile.write_text(str(os.getpid()))
+
+                def handle_term(signum, frame):
+                    marker.write_text("terminated")
+                    raise SystemExit(0)
+
+                signal.signal(signal.SIGTERM, handle_term)
+                sys.stdout.write('{{"event":"ready","transport":"stdio"}}\\n')
+                sys.stdout.flush()
+                while True:
+                    time.sleep(0.1)
+                """
+            )
+
+            timed_out = False
+            proc = None
+            try:
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        str(CLIENT),
+                        "--timeout",
+                        "0.1",
+                        "stdio",
+                        "workflow",
+                        str(recipe_path),
+                        "--",
+                        sys.executable,
+                        "-c",
+                        stub,
+                        "-control-stdio",
+                    ],
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=1.0,
+                )
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            finally:
+                if timed_out and pidfile.exists():
+                    try:
+                        os.kill(int(pidfile.read_text()), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    time.sleep(0.1)
+
+            self.assertFalse(timed_out, "client did not return promptly after workflow timeout")
+            self.assertIsNotNone(proc)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("workflow step 0 wait_for failed", proc.stderr)
+            self.assertIn("timed out waiting for workflow event", proc.stderr)
+            self.assertEqual(marker.read_text(), "terminated")
+
     def test_repl_socket_timeout_exits_nonzero(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             sock_path = str(Path(tmpdir) / "control.sock")
