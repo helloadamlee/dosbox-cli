@@ -150,6 +150,67 @@ running.
 The client writes raw JSON events to stdout. REPL prompts and local help are
 written to stderr so stdout remains machine-readable.
 
+### Workflow recipes
+
+Workflow mode runs a JSON recipe with sequential host-control steps:
+
+```bash
+scripts/host_control_client.py --timeout 10 socket /tmp/dosboxx.sock workflow recipe.json
+scripts/host_control_client.py --timeout 10 --transcript run.jsonl socket /tmp/dosboxx.sock workflow recipe.json
+scripts/host_control_client.py --timeout 10 stdio workflow recipe.json -- ./src/dosbox-x -control-stdio -headless -noconfig -noautoexec
+```
+
+Recipe files are JSON only and use a top-level `steps` array:
+
+```json
+{
+  "steps": [
+    {"comment": "Mount and inspect a project"},
+    {"exec": "mount c /home/me/project"},
+    {"wait_for": {"event": "result", "ok": true}},
+    {"status": true},
+    {"input_text": "dir\n"},
+    {"key": "enter"},
+    {"wait_for": "input_result"},
+    {}
+  ]
+}
+```
+
+Supported steps:
+
+- `{"exec":"command"}` sends an `exec` request and waits for `result`
+- `{"status":true}` sends a `status` request and waits for `status`
+- `{"input_text":"text"}` sends an `input_text` request and waits for
+  `input_result`
+- `{"key":"enter"}` sends a `key` request and waits for `input_result`
+- `{"wait_for":"output"}` waits for the next matching event without sending a
+  request
+- `{"wait_for":{"event":"result","ok":true}}` waits for an event whose listed
+  fields all match exactly
+- `{"comment":"text"}` and `{}` are no-ops
+
+String `wait_for` aliases are `ready`, `output`, `result`, `status`, `error`,
+and `input_result`. Object matchers are shallow exact field matches. Workflow
+mode does not decode output, run regular expressions, or support variables,
+conditionals, loops, or parallel steps.
+
+Socket workflows may use every step type. Stdio workflows reject `input_text`
+and `key` steps before spawning DOSBox-X because host-control input injection is
+socket-only.
+
+When `--transcript <path>` is provided, workflow mode writes one JSON object per
+event to the JSONL transcript while preserving stdout exactly as raw server
+events:
+
+```json
+{"type":"event","raw":"{\"event\":\"ready\",\"transport\":\"socket\"}\n","event":{"event":"ready","transport":"socket"}}
+```
+
+Workflow failures exit nonzero and write diagnostics to stderr. Timeout and
+server-error diagnostics include the failing step index, action name, the error,
+and recent raw events so an agent can report useful context.
+
 REPL commands:
 
 - `status`
