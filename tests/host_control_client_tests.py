@@ -379,6 +379,47 @@ class HostControlClientTest(unittest.TestCase):
         with self.assertRaisesRegex(module.WorkflowError, "step 0: expected object"):
             module.parse_workflow_recipe({"steps": ["exec dir"]})
 
+    def test_parse_workflow_recipe_accepts_interactive_exec_steps(self):
+        module = load_client_module()
+        recipe = {
+            "steps": [
+                {
+                    "exec_interactive": {
+                        "command": "pause",
+                        "steps": [
+                            {"wait_for": "output"},
+                            {"key": "enter"},
+                            {"wait_for": {"event": "result", "ok": True}},
+                        ],
+                    }
+                }
+            ]
+        }
+
+        steps = module.parse_workflow_recipe(recipe)
+
+        self.assertEqual(steps[0].action, "exec_interactive")
+        self.assertEqual(steps[0].value["command"], "pause")
+        nested = steps[0].value["steps"]
+        self.assertEqual([step.action for step in nested], ["wait_for", "key", "wait_for"])
+        self.assertEqual(nested[1].value, "enter")
+
+    def test_parse_workflow_recipe_rejects_malformed_interactive_exec_steps(self):
+        module = load_client_module()
+
+        with self.assertRaisesRegex(module.WorkflowError, "step 0: exec_interactive must be an object"):
+            module.parse_workflow_recipe({"steps": [{"exec_interactive": "pause"}]})
+        with self.assertRaisesRegex(module.WorkflowError, "step 0: exec_interactive.command"):
+            module.parse_workflow_recipe({"steps": [{"exec_interactive": {"steps": []}}]})
+        with self.assertRaisesRegex(module.WorkflowError, "step 0: exec_interactive.steps"):
+            module.parse_workflow_recipe(
+                {"steps": [{"exec_interactive": {"command": "pause"}}]}
+            )
+        with self.assertRaisesRegex(module.WorkflowError, "step 0.0: expected object"):
+            module.parse_workflow_recipe(
+                {"steps": [{"exec_interactive": {"command": "pause", "steps": ["key enter"]}}]}
+            )
+
     def test_parse_args_accepts_workflow_and_transcript(self):
         module = load_client_module()
 
@@ -445,6 +486,102 @@ class HostControlClientTest(unittest.TestCase):
                     '{"id":"2","op":"status"}\n',
                     '{"id":"3","op":"input_text","text":"dir\\n"}\n',
                     '{"id":"4","op":"key","key":"enter"}\n',
+                ],
+            )
+
+    def test_socket_workflow_interactive_exec_sends_input_before_result(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            recipe_path = self._write_recipe(
+                tmpdir,
+                {
+                    "steps": [
+                        {
+                            "exec_interactive": {
+                                "command": "pause",
+                                "steps": [
+                                    {"wait_for": "output"},
+                                    {"key": "enter"},
+                                    {"wait_for": {"event": "result", "ok": True}},
+                                ],
+                            }
+                        }
+                    ]
+                },
+            )
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"output","id":"1","encoding":"base64","data":"UHJlc3MgYW55IGtleQ=="}\n',
+                '{"event":"input_result","id":"2","ok":true,"queued":1}\n',
+                '{"event":"result","id":"1","ok":true,"shell_exit":false,"errorlevel":0,"drive":"Z","cwd":"Z:\\\\","duration_ms":1}\n',
+            ]
+            thread = self._serve_socket_workflow(sock_path, lines, requests, expected_requests=2)
+
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "socket", sock_path, "workflow", str(recipe_path)],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.join(timeout=2)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertEqual(
+                requests,
+                [
+                    '{"id":"1","op":"exec","command":"pause"}\n',
+                    '{"id":"2","op":"key","key":"enter"}\n',
+                ],
+            )
+
+    def test_socket_workflow_interactive_exec_preserves_early_parent_result(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            recipe_path = self._write_recipe(
+                tmpdir,
+                {
+                    "steps": [
+                        {
+                            "exec_interactive": {
+                                "command": "fast",
+                                "steps": [
+                                    {"wait_for": "output"},
+                                    {"key": "enter"},
+                                    {"wait_for": {"event": "result", "id": "1", "ok": True}},
+                                ],
+                            }
+                        }
+                    ]
+                },
+            )
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"output","id":"1","encoding":"base64","data":"Z29pbmc="}\n',
+                '{"event":"result","id":"1","ok":true,"shell_exit":false,"errorlevel":0,"drive":"Z","cwd":"Z:\\\\","duration_ms":1}\n',
+                '{"event":"input_result","id":"2","ok":true,"queued":1}\n',
+            ]
+            thread = self._serve_socket_workflow(sock_path, lines, requests, expected_requests=2)
+
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "socket", sock_path, "workflow", str(recipe_path)],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.join(timeout=2)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertEqual(
+                requests,
+                [
+                    '{"id":"1","op":"exec","command":"fast"}\n',
+                    '{"id":"2","op":"key","key":"enter"}\n',
                 ],
             )
 
@@ -518,6 +655,55 @@ class HostControlClientTest(unittest.TestCase):
             self.assertIn("timed out waiting for workflow event", proc.stderr)
             self.assertIn('"event":"output"', proc.stderr)
 
+    def test_socket_workflow_interactive_timeout_reports_nested_step_context(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            recipe_path = self._write_recipe(
+                tmpdir,
+                {
+                    "steps": [
+                        {"comment": "make the interactive step index nonzero"},
+                        {
+                            "exec_interactive": {
+                                "command": "pause",
+                                "steps": [{"wait_for": "result"}],
+                            }
+                        },
+                    ]
+                },
+            )
+            requests = []
+            lines = ['{"event":"ready","transport":"socket"}\n']
+            thread = self._serve_socket_hanging_after_lines(sock_path, lines, requests)
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLIENT),
+                    "--timeout",
+                    "0.1",
+                    "socket",
+                    sock_path,
+                    "workflow",
+                    str(recipe_path),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.join(timeout=2)
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertIn(
+                "workflow step 1 exec_interactive nested step 0 wait_for failed",
+                proc.stderr,
+            )
+            self.assertIn("timed out waiting for workflow event", proc.stderr)
+            self.assertIn('"event":"ready"', proc.stderr)
+            self.assertEqual(requests, ['{"id":"1","op":"exec","command":"pause"}\n'])
+
     def test_socket_workflow_fails_on_matching_error_event(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             sock_path = str(Path(tmpdir) / "control.sock")
@@ -569,6 +755,44 @@ class HostControlClientTest(unittest.TestCase):
             self.assertIn("input_text actions are socket-only", proc.stderr)
             self.assertNotIn("should not spawn", proc.stderr)
 
+    def test_stdio_workflow_rejects_interactive_exec_before_spawn(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            recipe_path = self._write_recipe(
+                tmpdir,
+                {
+                    "steps": [
+                        {
+                            "exec_interactive": {
+                                "command": "pause",
+                                "steps": [{"key": "enter"}],
+                            }
+                        }
+                    ]
+                },
+            )
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLIENT),
+                    "stdio",
+                    "workflow",
+                    str(recipe_path),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "raise SystemExit('should not spawn')",
+                    "-control-stdio",
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("exec_interactive actions are socket-only", proc.stderr)
+            self.assertNotIn("should not spawn", proc.stderr)
+
     def test_socket_workflow_writes_jsonl_transcript_without_changing_stdout(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             sock_path = str(Path(tmpdir) / "control.sock")
@@ -608,6 +832,63 @@ class HostControlClientTest(unittest.TestCase):
             self.assertEqual([entry["type"] for entry in entries], ["event", "event"])
             self.assertEqual(entries[0]["raw"], lines[0])
             self.assertEqual(entries[1]["event"]["event"], "status")
+
+    def test_socket_workflow_interactive_exec_writes_transcript(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            recipe_path = self._write_recipe(
+                tmpdir,
+                {
+                    "steps": [
+                        {
+                            "exec_interactive": {
+                                "command": "pause",
+                                "steps": [
+                                    {"wait_for": "output"},
+                                    {"key": "enter"},
+                                    {"wait_for": "result"},
+                                ],
+                            }
+                        }
+                    ]
+                },
+            )
+            transcript_path = Path(tmpdir) / "interactive.jsonl"
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"output","id":"1","encoding":"base64","data":"UHJlc3MgYW55IGtleQ=="}\n',
+                '{"event":"input_result","id":"2","ok":true,"queued":1}\n',
+                '{"event":"result","id":"1","ok":true,"shell_exit":false,"errorlevel":0,"drive":"Z","cwd":"Z:\\\\","duration_ms":1}\n',
+            ]
+            thread = self._serve_socket_workflow(sock_path, lines, requests, expected_requests=2)
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLIENT),
+                    "--transcript",
+                    str(transcript_path),
+                    "socket",
+                    sock_path,
+                    "workflow",
+                    str(recipe_path),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.join(timeout=2)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "".join(lines))
+            entries = [
+                json.loads(line)
+                for line in transcript_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual([entry["raw"] for entry in entries], lines)
+            self.assertEqual(entries[-1]["event"]["event"], "result")
 
     def test_parse_rejects_non_positive_timeout(self):
         proc = subprocess.run(

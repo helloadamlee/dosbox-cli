@@ -25,7 +25,15 @@ class WorkflowStep:
     value: object = None
 
 
-WORKFLOW_ACTIONS = {"comment", "exec", "status", "input_text", "key", "wait_for"}
+WORKFLOW_ACTIONS = {
+    "comment",
+    "exec",
+    "exec_interactive",
+    "status",
+    "input_text",
+    "key",
+    "wait_for",
+}
 WAIT_EVENT_ALIASES = {"ready", "output", "result", "status", "error", "input_result"}
 
 
@@ -35,11 +43,15 @@ def parse_workflow_recipe(recipe):
     steps = recipe.get("steps")
     if not isinstance(steps, list):
         raise WorkflowError("recipe.steps: expected array")
+    return parse_workflow_steps(steps)
 
+
+def parse_workflow_steps(steps, prefix="step"):
     parsed = []
     for index, step in enumerate(steps):
+        step_name = f"{prefix} {index}" if prefix == "step" else f"{prefix}.{index}"
         if not isinstance(step, dict):
-            raise WorkflowError(f"step {index}: expected object")
+            raise WorkflowError(f"{step_name}: expected object")
         if not step:
             parsed.append(WorkflowStep("noop"))
             continue
@@ -47,30 +59,45 @@ def parse_workflow_recipe(recipe):
         actions = [key for key in step if key in WORKFLOW_ACTIONS]
         unknown = [key for key in step if key not in WORKFLOW_ACTIONS]
         if unknown:
-            raise WorkflowError(f"step {index}: unknown action {unknown[0]}")
+            raise WorkflowError(f"{step_name}: unknown action {unknown[0]}")
         if len(actions) != 1:
-            raise WorkflowError(f"step {index}: multiple actions")
+            raise WorkflowError(f"{step_name}: multiple actions")
 
         action = actions[0]
         value = step[action]
         if action == "comment":
             if not isinstance(value, str):
-                raise WorkflowError(f"step {index}: comment must be a string")
+                raise WorkflowError(f"{step_name}: comment must be a string")
         elif action == "exec":
             if not isinstance(value, str) or not value:
-                raise WorkflowError(f"step {index}: exec must be a non-empty string")
+                raise WorkflowError(f"{step_name}: exec must be a non-empty string")
+        elif action == "exec_interactive":
+            if not isinstance(value, dict):
+                raise WorkflowError(f"{step_name}: exec_interactive must be an object")
+            command = value.get("command")
+            if not isinstance(command, str) or not command:
+                raise WorkflowError(
+                    f"{step_name}: exec_interactive.command must be a non-empty string"
+                )
+            nested_steps = value.get("steps")
+            if not isinstance(nested_steps, list):
+                raise WorkflowError(f"{step_name}: exec_interactive.steps must be an array")
+            value = {
+                "command": command,
+                "steps": parse_workflow_steps(nested_steps, prefix=f"{step_name}"),
+            }
         elif action == "status":
             if value not in (True, None) and value != {}:
-                raise WorkflowError(f"step {index}: status must be true, null, or object")
+                raise WorkflowError(f"{step_name}: status must be true, null, or object")
         elif action == "input_text":
             if not isinstance(value, str):
-                raise WorkflowError(f"step {index}: input_text must be a string")
+                raise WorkflowError(f"{step_name}: input_text must be a string")
         elif action == "key":
             if not isinstance(value, str) or not value:
-                raise WorkflowError(f"step {index}: key must be a non-empty string")
+                raise WorkflowError(f"{step_name}: key must be a non-empty string")
         elif action == "wait_for":
             if not isinstance(value, (str, dict)):
-                raise WorkflowError(f"step {index}: wait_for must be a string or object")
+                raise WorkflowError(f"{step_name}: wait_for must be a string or object")
         parsed.append(WorkflowStep(action, value))
     return parsed
 
@@ -139,11 +166,20 @@ def wait_for_workflow_event(transport, matcher, timeout=None, recorder=None):
 
 
 def validate_workflow_for_transport(steps, allow_input):
-    if allow_input:
-        return
+    validate_workflow_steps_for_transport(steps, allow_input)
+
+
+def validate_workflow_steps_for_transport(steps, allow_input, prefix="step"):
     for index, step in enumerate(steps):
-        if step.action in ("input_text", "key"):
-            raise WorkflowError(f"step {index}: {step.action} actions are socket-only")
+        step_name = f"{prefix} {index}" if prefix == "step" else f"{prefix}.{index}"
+        if not allow_input and step.action in ("input_text", "key", "exec_interactive"):
+            raise WorkflowError(f"{step_name}: {step.action} actions are socket-only")
+        if step.action == "exec_interactive":
+            validate_workflow_steps_for_transport(
+                step.value["steps"],
+                allow_input,
+                prefix=f"{step_name}",
+            )
 
 
 def encode_request(request_id, op, command=None, text=None, key=None):
@@ -426,73 +462,169 @@ def run_repl(transport, timeout=None, allow_input=True):
         next_request_id += 1
 
 
-def run_workflow(transport, steps, timeout=None, allow_input=True, transcript=None):
-    recorder = EventRecorder(transcript=transcript)
-    read_event_line(transport, make_deadline(timeout), "ready event", recorder=recorder)
-    next_request_id = 1
+class WorkflowRuntime:
+    def __init__(self, transport, timeout=None, allow_input=True, transcript=None):
+        self.transport = transport
+        self.timeout = timeout
+        self.allow_input = allow_input
+        self.recorder = EventRecorder(transcript=transcript)
+        self.next_request_id = 1
+        self.request_ops = {}
+        self.completed_requests = {}
+        self.pending_events = []
 
-    for index, step in enumerate(steps):
+    def read_event(self, description):
+        event = read_event_line(
+            self.transport,
+            make_deadline(self.timeout),
+            description,
+            recorder=self.recorder,
+        )
+        self.remember_completion(event)
+        return event
+
+    def remember_completion(self, event):
+        request_id = str(event.get("id", ""))
+        op = self.request_ops.get(request_id)
+        if op is not None and event_completes_request(event, request_id, op):
+            self.completed_requests[request_id] = event
+
+    def send_request(self, op, command=None, text=None, key=None):
+        request_id = str(self.next_request_id)
+        self.next_request_id += 1
+        self.request_ops[request_id] = op
+        self.transport.writeline(encode_request(request_id, op, command, text, key))
+        return request_id
+
+    def wait_for_request(self, request_id, fail_on_error=True):
+        request_id = str(request_id)
+        if request_id in self.completed_requests:
+            event = self.completed_requests[request_id]
+            if fail_on_error and event.get("event") == "error":
+                raise WorkflowError(
+                    f"server error for request {request_id}: {event.get('message', '')}"
+                )
+            return event
+
+        op = self.request_ops[request_id]
+        remaining_pending = []
+        for event in self.pending_events:
+            if event_completes_request(event, request_id, op):
+                self.completed_requests[request_id] = event
+            else:
+                remaining_pending.append(event)
+        self.pending_events = remaining_pending
+
+        if request_id in self.completed_requests:
+            event = self.completed_requests[request_id]
+            if fail_on_error and event.get("event") == "error":
+                raise WorkflowError(
+                    f"server error for request {request_id}: {event.get('message', '')}"
+                )
+            return event
+
+        while True:
+            event = self.read_event(f"{op} request {request_id}")
+            if event_completes_request(event, request_id, op):
+                if fail_on_error and event.get("event") == "error":
+                    raise WorkflowError(
+                        f"server error for request {request_id}: {event.get('message', '')}"
+                    )
+                return event
+            self.pending_events.append(event)
+
+    def run_request(self, op, command=None, text=None, key=None):
+        request_id = self.send_request(op, command=command, text=text, key=key)
+        self.wait_for_request(request_id)
+        return request_id
+
+    def wait_for_event(self, matcher):
+        remaining_pending = []
+        matched = None
+        for event in self.pending_events:
+            if matched is None and event_matches(event, matcher):
+                matched = event
+            else:
+                remaining_pending.append(event)
+        self.pending_events = remaining_pending
+        if matched is not None:
+            return matched
+
+        while True:
+            event = self.read_event("workflow event")
+            if event_matches(event, matcher):
+                return event
+            self.pending_events.append(event)
+
+    def run_steps(self, steps, context_prefix="workflow step"):
+        for index, step in enumerate(steps):
+            step_context = f"{context_prefix} {index}"
+            self.run_step(step, step_context)
+
+    def run_step(self, step, step_context):
         if step.action in ("noop", "comment"):
-            continue
+            return
         try:
             if step.action == "exec":
-                run_request(
-                    transport,
-                    next_request_id,
-                    "exec",
-                    command=step.value,
-                    timeout=timeout,
-                    recorder=recorder,
-                    fail_on_error=True,
-                )
-                next_request_id += 1
+                self.run_request("exec", command=step.value)
             elif step.action == "status":
-                run_request(
-                    transport,
-                    next_request_id,
-                    "status",
-                    timeout=timeout,
-                    recorder=recorder,
-                    fail_on_error=True,
-                )
-                next_request_id += 1
+                self.run_request("status")
             elif step.action == "input_text":
-                if not allow_input:
+                if not self.allow_input:
                     raise WorkflowError("input_text actions are socket-only")
-                run_request(
-                    transport,
-                    next_request_id,
-                    "input_text",
-                    text=step.value,
-                    timeout=timeout,
-                    recorder=recorder,
-                    fail_on_error=True,
-                )
-                next_request_id += 1
+                self.run_request("input_text", text=step.value)
             elif step.action == "key":
-                if not allow_input:
+                if not self.allow_input:
                     raise WorkflowError("key actions are socket-only")
-                run_request(
-                    transport,
-                    next_request_id,
-                    "key",
-                    key=step.value,
-                    timeout=timeout,
-                    recorder=recorder,
-                    fail_on_error=True,
-                )
-                next_request_id += 1
+                self.run_request("key", key=step.value)
             elif step.action == "wait_for":
-                wait_for_workflow_event(
-                    transport,
-                    step.value,
-                    timeout=timeout,
-                    recorder=recorder,
-                )
+                self.wait_for_event(step.value)
+            elif step.action == "exec_interactive":
+                self.run_exec_interactive(step, step_context)
         except RequestTimeout as exc:
-            raise RequestTimeout(format_workflow_failure(index, step, exc, recorder)) from exc
+            if str(exc).startswith("workflow step "):
+                raise
+            raise RequestTimeout(
+                self.format_failure(step_context, step.action, exc)
+            ) from exc
+        except WorkflowError as exc:
+            if str(exc).startswith("workflow step "):
+                raise
+            raise WorkflowError(
+                self.format_failure(step_context, step.action, exc)
+            ) from exc
         except RuntimeError as exc:
-            raise WorkflowError(format_workflow_failure(index, step, exc, recorder)) from exc
+            raise WorkflowError(
+                self.format_failure(step_context, step.action, exc)
+            ) from exc
+
+    def run_exec_interactive(self, step, step_context):
+        if not self.allow_input:
+            raise WorkflowError("exec_interactive actions are socket-only")
+        request_id = self.send_request("exec", command=step.value["command"])
+        self.run_steps(
+            step.value["steps"],
+            context_prefix=f"{step_context} exec_interactive nested step",
+        )
+        self.wait_for_request(request_id)
+
+    def format_failure(self, step_context, action, exc):
+        lines = [f"{step_context} {action} failed: {exc}"]
+        if self.recorder.recent:
+            lines.append("recent events:")
+            lines.extend(line.rstrip("\r\n") for line in self.recorder.recent)
+        return "\n".join(lines)
+
+
+def run_workflow(transport, steps, timeout=None, allow_input=True, transcript=None):
+    runtime = WorkflowRuntime(
+        transport,
+        timeout=timeout,
+        allow_input=allow_input,
+        transcript=transcript,
+    )
+    runtime.read_event("ready event")
+    runtime.run_steps(steps)
     return 0
 
 

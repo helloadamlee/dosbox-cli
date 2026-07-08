@@ -170,19 +170,90 @@ class HostControlLiveTest(unittest.TestCase):
                             f"client stderr:\n{exc.stderr or ''}\n"
                             + self.server_diagnostics(stdout_path, stderr_path, server)
                         )
-                    try:
-                        server.wait(timeout=timeout_seconds)
-                    except subprocess.TimeoutExpired:
+                finally:
+                    if server.poll() is None:
                         server.terminate()
                         try:
                             server.wait(timeout=2)
                         except subprocess.TimeoutExpired:
                             server.kill()
                             server.wait()
+                    server_stdout.flush()
+                    server_stderr.flush()
+                server_stdout_text, server_stderr_text = self.read_server_logs(
+                    stdout_path, stderr_path
+                )
+
+        events = self.parse_events(proc, server_stdout_text, server_stderr_text)
+        return ReplResult(proc, events, server_stdout_text, server_stderr_text)
+
+    def run_socket_workflow(self, recipe, timeout_seconds=10):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = Path(tmpdir) / "control.sock"
+            recipe_path = Path(tmpdir) / "recipe.json"
+            recipe_path.write_text(json.dumps(recipe), encoding="utf-8")
+            stdout_path = Path(tmpdir) / "server.stdout"
+            stderr_path = Path(tmpdir) / "server.stderr"
+            with stdout_path.open("w", encoding="utf-8") as server_stdout, stderr_path.open(
+                "w", encoding="utf-8"
+            ) as server_stderr:
+                server = subprocess.Popen(
+                    [
+                        str(self.dosbox_x),
+                        "-control-socket",
+                        str(sock_path),
+                        "-headless",
+                        "-noconfig",
+                        "-noautoexec",
+                    ],
+                    stdout=server_stdout,
+                    stderr=server_stderr,
+                    text=True,
+                )
+                try:
+                    deadline = time.monotonic() + timeout_seconds
+                    while time.monotonic() < deadline and not sock_path.exists():
+                        if server.poll() is not None:
+                            server_stdout.flush()
+                            server_stderr.flush()
+                            self.fail(
+                                "server exited before creating socket\n"
+                                + self.server_diagnostics(stdout_path, stderr_path, server)
+                            )
+                        time.sleep(0.05)
+                    if not sock_path.exists():
                         server_stdout.flush()
                         server_stderr.flush()
                         self.fail(
-                            "server did not exit after client completed\n"
+                            "socket was not created\n"
+                            + self.server_diagnostics(stdout_path, stderr_path, server)
+                        )
+
+                    try:
+                        proc = subprocess.run(
+                            [
+                                sys.executable,
+                                str(CLIENT),
+                                "--timeout",
+                                str(timeout_seconds),
+                                "socket",
+                                str(sock_path),
+                                "workflow",
+                                str(recipe_path),
+                            ],
+                            text=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            timeout=timeout_seconds + 5,
+                            check=False,
+                        )
+                    except subprocess.TimeoutExpired as exc:
+                        server_stdout.flush()
+                        server_stderr.flush()
+                        self.fail(
+                            f"client timed out after {exc.timeout} seconds\n"
+                            f"client stdout:\n{exc.stdout or ''}\n"
+                            f"client stderr:\n{exc.stderr or ''}\n"
                             + self.server_diagnostics(stdout_path, stderr_path, server)
                         )
                 finally:
@@ -240,6 +311,33 @@ class HostControlLiveTest(unittest.TestCase):
         self.assertEqual(result.proc.returncode, 0, result.diagnostics())
         self.assertTrue(
             any(event.get("event") == "output" for event in result.events), result.diagnostics()
+        )
+
+    def test_socket_workflow_interactive_dir_streams_output(self):
+        result = self.run_socket_workflow(
+            {
+                "steps": [
+                    {
+                        "exec_interactive": {
+                            "command": "dir",
+                            "steps": [
+                                {"wait_for": "output"},
+                                {"wait_for": {"event": "result", "ok": True}},
+                            ],
+                        }
+                    }
+                ]
+            },
+            timeout_seconds=10,
+        )
+
+        self.assertEqual(result.proc.returncode, 0, result.diagnostics())
+        self.assertTrue(
+            any(event.get("event") == "output" for event in result.events), result.diagnostics()
+        )
+        self.assertTrue(
+            any(event.get("event") == "result" and event.get("ok") for event in result.events),
+            result.diagnostics(),
         )
 
 
