@@ -14,7 +14,10 @@
 #include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
+#include <fcntl.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 #endif
@@ -302,6 +305,159 @@ bool has_socket_session_peer_disconnected(SocketSessionState &state)
 
 	return mark_socket_session_disconnected(state, true);
 }
+
+struct PipeSessionState {
+	int read_fd = -1;
+	int write_fd = -1;
+	std::mutex mutex = {};
+	std::condition_variable condition = {};
+	std::deque<Request> requests = {};
+	bool disconnected = false;
+	bool stop_reader = false;
+	bool had_io_error = false;
+};
+
+bool write_pipe_session_line(PipeSessionState &state, const std::string &line)
+{
+	if (line.empty()) {
+		return true;
+	}
+
+	std::lock_guard<std::mutex> lock(state.mutex);
+	if (!write_fd_line(state.write_fd, line)) {
+		state.had_io_error = true;
+		state.disconnected = true;
+		session_write_failed.store(true);
+		state.condition.notify_all();
+		return false;
+	}
+
+	return true;
+}
+
+bool should_stop_pipe_reader(PipeSessionState &state)
+{
+	std::lock_guard<std::mutex> lock(state.mutex);
+	return state.stop_reader;
+}
+
+bool read_pipe_line(PipeSessionState &state, std::string &line)
+{
+	line.clear();
+
+	for (;;) {
+		if (should_stop_pipe_reader(state)) {
+			return false;
+		}
+
+		fd_set read_fds;
+		FD_ZERO(&read_fds);
+		FD_SET(state.read_fd, &read_fds);
+		timeval timeout = {};
+		timeout.tv_usec = 100000;
+		const auto selected = select(state.read_fd + 1, &read_fds, nullptr, nullptr, &timeout);
+		if (selected < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return false;
+		}
+		if (selected == 0) {
+			continue;
+		}
+
+		char byte = 0;
+		const auto received = read(state.read_fd, &byte, 1);
+		if (received == 0) {
+			return !line.empty();
+		}
+		if (received < 0) {
+			if (errno == EINTR || is_socket_would_block_error(errno)) {
+				continue;
+			}
+			return false;
+		}
+
+		if (byte == '\n') {
+			return true;
+		}
+		if (byte == '\r') {
+			continue;
+		}
+
+		line += byte;
+	}
+}
+
+void handle_pipe_input_request(PipeSessionState &state, const Request &request)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+	const bool built = request.op == "input_text"
+	                         ? build_input_codes_for_text(request.text, codes, error)
+	                         : build_input_codes_for_key(request.key, codes, error);
+	if (!built) {
+		(void)write_pipe_session_line(state, make_error_json_line(request.id, error));
+		return;
+	}
+
+	const auto queued = queue_input_codes(codes);
+	if (!queued.ok) {
+		(void)write_pipe_session_line(state, make_error_json_line(request.id, queued.error));
+		return;
+	}
+
+	(void)write_pipe_session_line(
+	        state, make_input_result_json_line(request.id, true, queued.queued));
+}
+
+void pipe_session_reader(PipeSessionState &state)
+{
+	for (;;) {
+		std::string line = {};
+		if (!read_pipe_line(state, line)) {
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.disconnected = true;
+			state.condition.notify_all();
+			return;
+		}
+		if (line.empty()) {
+			continue;
+		}
+
+		const auto request = parse_request_line(line);
+		if (!request.ok) {
+			(void)write_pipe_session_line(
+			        state, make_error_json_line(request.id, request.error));
+			continue;
+		}
+
+		if (request.op == "input_text" || request.op == "key") {
+			handle_pipe_input_request(state, request);
+			continue;
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.requests.push_back(request);
+		}
+		state.condition.notify_all();
+	}
+}
+
+bool is_pipe_session_disconnected(PipeSessionState &state)
+{
+	std::lock_guard<std::mutex> lock(state.mutex);
+	return state.disconnected;
+}
+
+void stop_pipe_session_reader(PipeSessionState &state)
+{
+	std::lock_guard<std::mutex> lock(state.mutex);
+	state.stop_reader = true;
+	state.disconnected = true;
+	state.condition.notify_all();
+}
 #else
 bool read_stdin_line(std::string &line)
 {
@@ -568,6 +724,130 @@ SessionResult run_control_socket_session(const Options &options,
 #endif
 }
 
+SessionResult run_control_pipe_session(const Options &options,
+                                       int read_fd,
+                                       int write_fd,
+                                       const ExecRequestFn &exec_request)
+{
+	SessionResult result = {};
+
+#if !defined(__unix__) && !defined(__APPLE__)
+	(void)options;
+	(void)read_fd;
+	(void)write_fd;
+	(void)exec_request;
+	result.had_io_error = true;
+	return result;
+#else
+	PipeSessionState state = {};
+	state.read_fd = read_fd;
+	state.write_fd = write_fd;
+
+	active_write_line = [&state](const std::string &line) {
+		return write_pipe_session_line(state, line);
+	};
+	active_request_id.clear();
+	reset_buffered_output(buffered_output, {});
+	session_write_failed.store(false);
+	session_active = true;
+
+	if (!emit_session_line(make_ready_json_line(options))) {
+		result.had_io_error = true;
+		close_fd(state.read_fd);
+		close_fd(state.write_fd);
+		reset_session_state();
+		return result;
+	}
+
+	result.started = true;
+	std::thread reader(pipe_session_reader, std::ref(state));
+
+	for (;;) {
+		Request request = {};
+		{
+			std::unique_lock<std::mutex> lock(state.mutex);
+			state.condition.wait(lock, [&state]() {
+				return !state.requests.empty() || state.disconnected;
+			});
+			if (state.disconnected && state.requests.empty()) {
+				break;
+			}
+			if (!state.requests.empty()) {
+				request = state.requests.front();
+				state.requests.pop_front();
+			}
+		}
+
+		if (is_pipe_session_disconnected(state)) {
+			break;
+		}
+
+		if (request.op == "status") {
+			if (!emit_session_line(make_status_json_line(request.id, snapshot_status(options)))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
+		if (request.op != "exec") {
+			if (!emit_session_line(make_error_json_line(request.id, "unsupported op"))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
+		CommandResult command_result = {};
+		active_request_id = request.id;
+		reset_buffered_output(buffered_output, request.id);
+		const auto start_ms = get_monotonic_ms();
+		const bool ok = exec_request(request, command_result);
+		const auto end_ms = get_monotonic_ms();
+		command_result.duration_ms = end_ms >= start_ms ? (end_ms - start_ms) : 0;
+		if (is_pipe_session_disconnected(state)) {
+			active_request_id.clear();
+			break;
+		}
+		if (session_write_failed.load() ||
+		    !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
+			result.had_io_error = true;
+			active_request_id.clear();
+			break;
+		}
+		active_request_id.clear();
+
+		if (!emit_session_line(make_exec_result_json_line(request.id, ok, command_result))) {
+			result.had_io_error = true;
+			break;
+		}
+		if (command_result.shell_exit) {
+			break;
+		}
+	}
+
+	if (!result.had_io_error && !is_pipe_session_disconnected(state) &&
+	    !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
+		result.had_io_error = true;
+	}
+
+	stop_pipe_session_reader(state);
+	if (reader.joinable()) {
+		reader.join();
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(state.mutex);
+		result.had_io_error = result.had_io_error || state.had_io_error;
+	}
+
+	close_fd(state.read_fd);
+	close_fd(state.write_fd);
+	reset_session_state();
+	return result;
+#endif
+}
+
 bool run_stdio_shell()
 {
 	if (control == nullptr || !is_stdio_enabled(control->opt_host_control)) {
@@ -622,9 +902,120 @@ bool run_pipe_shell()
 		return false;
 	}
 
-	std::fprintf(stderr, "Host control pipe transport is not implemented\n");
+#if !defined(__unix__) && !defined(__APPLE__)
+	std::fprintf(stderr, "Host control pipe transport is unsupported on this platform\n");
 	std::fflush(stderr);
 	return false;
+#else
+	PipeServer server = {};
+	std::string error = {};
+	if (!open_pipe_server(control->opt_host_control.endpoint, server, error)) {
+		std::fprintf(stderr, "%s\n", error.c_str());
+		std::fflush(stderr);
+		return false;
+	}
+
+	int output_fd = -1;
+	do {
+		output_fd = open(server.output_path.c_str(), O_WRONLY);
+	} while (output_fd < 0 && errno == EINTR);
+
+	if (output_fd < 0) {
+		error = make_errno_message("failed to open host control pipe output",
+		                           server.output_path);
+		close_pipe_server(server);
+		std::fprintf(stderr, "%s\n", error.c_str());
+		std::fflush(stderr);
+		return false;
+	}
+
+	const int input_fd = server.input_fd;
+	server.input_fd = -1;
+	const auto result = run_control_pipe_session(
+	        control->opt_host_control,
+	        input_fd,
+	        output_fd,
+	        [](const Request &request, CommandResult &result) {
+		        const bool ok = SHELL_ExecuteHostCommand(request.command, result.shell_exit);
+		        if (ok) {
+			        populate_command_result(result);
+		        }
+		        return ok;
+	        });
+
+	close_pipe_server(server);
+	return result.started;
+#endif
+}
+
+bool open_pipe_server(const std::string &path, PipeServer &server, std::string &error)
+{
+	server = {};
+	error.clear();
+
+#if !defined(__unix__) && !defined(__APPLE__)
+	error = "host control pipe transport is unsupported on this platform";
+	return false;
+#else
+	if (path.empty()) {
+		error = "host control pipe path is empty";
+		return false;
+	}
+
+	server.base_path = path;
+	server.input_path = path + ".in";
+	server.output_path = path + ".out";
+
+	if (unlink(server.input_path.c_str()) != 0 && errno != ENOENT) {
+		error = make_errno_message("failed to remove stale host control pipe",
+		                           server.input_path);
+		return false;
+	}
+	if (unlink(server.output_path.c_str()) != 0 && errno != ENOENT) {
+		error = make_errno_message("failed to remove stale host control pipe",
+		                           server.output_path);
+		return false;
+	}
+
+	if (mkfifo(server.input_path.c_str(), 0600) != 0) {
+		error = make_errno_message("failed to create host control pipe",
+		                           server.input_path);
+		return false;
+	}
+	server.created_input_path = true;
+
+	if (mkfifo(server.output_path.c_str(), 0600) != 0) {
+		error = make_errno_message("failed to create host control pipe",
+		                           server.output_path);
+		close_pipe_server(server);
+		return false;
+	}
+	server.created_output_path = true;
+
+	server.input_fd = open(server.input_path.c_str(), O_RDONLY | O_NONBLOCK);
+	if (server.input_fd < 0) {
+		error = make_errno_message("failed to open host control pipe input",
+		                           server.input_path);
+		close_pipe_server(server);
+		return false;
+	}
+
+	return true;
+#endif
+}
+
+void close_pipe_server(PipeServer &server)
+{
+#if defined(__unix__) || defined(__APPLE__)
+	close_fd(server.input_fd);
+	if (server.created_input_path && !server.input_path.empty()) {
+		(void)unlink(server.input_path.c_str());
+	}
+	if (server.created_output_path && !server.output_path.empty()) {
+		(void)unlink(server.output_path.c_str());
+	}
+#endif
+	server = {};
 }
 
 bool open_socket_server(const std::string &path, SocketServer &server, std::string &error)

@@ -13,6 +13,7 @@
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -30,6 +31,14 @@ std::string make_temp_socket_path()
 	const auto dir = mkdtemp(templ);
 	EXPECT_NE(dir, nullptr);
 	return std::string(dir ? dir : "/tmp") + "/control.sock";
+}
+
+std::string make_temp_pipe_base_path()
+{
+	char templ[] = "/tmp/dosboxx-host-control-pipe-XXXXXX";
+	const auto dir = mkdtemp(templ);
+	EXPECT_NE(dir, nullptr);
+	return std::string(dir ? dir : "/tmp") + "/control";
 }
 
 class SocketSessionTestCleanup {
@@ -65,6 +74,55 @@ public:
 private:
 	std::promise<void> &allow_exec_finish;
 	int &client_fd;
+	std::thread &server;
+	bool released = false;
+};
+
+class PipeSessionTestCleanup {
+public:
+	PipeSessionTestCleanup(std::promise<void> &finish_promise,
+	                       int (&client_to_server)[2],
+	                       int (&server_to_client)[2],
+	                       std::thread &thread)
+	        : allow_exec_finish(finish_promise),
+	          input_fds(client_to_server),
+	          output_fds(server_to_client),
+	          server(thread)
+	{}
+
+	~PipeSessionTestCleanup()
+	{
+		release_exec();
+		close_pair(input_fds);
+		close_pair(output_fds);
+		if (server.joinable()) {
+			server.join();
+		}
+		host_control::clear_queued_input();
+	}
+
+	void release_exec()
+	{
+		if (!released) {
+			allow_exec_finish.set_value();
+			released = true;
+		}
+	}
+
+private:
+	static void close_pair(int (&fds)[2])
+	{
+		for (auto &fd : fds) {
+			if (fd >= 0) {
+				(void)close(fd);
+				fd = -1;
+			}
+		}
+	}
+
+	std::promise<void> &allow_exec_finish;
+	int (&input_fds)[2];
+	int (&output_fds)[2];
 	std::thread &server;
 	bool released = false;
 };
@@ -1072,6 +1130,114 @@ TEST(HostControlProtocolTest, SocketServerRemovesStalePathAndCleansUpOnClose)
 	host_control::close_socket_server(server);
 	EXPECT_NE(access(socket_path.c_str(), F_OK), 0);
 	EXPECT_EQ(rmdir(socket_dir.c_str()), 0);
+}
+
+TEST(HostControlProtocolTest, PipeServerRejectsEmptyEndpoint)
+{
+	host_control::PipeServer server = {};
+	std::string error = {};
+
+	EXPECT_FALSE(host_control::open_pipe_server("", server, error));
+	EXPECT_NE(error.find("empty"), std::string::npos);
+}
+
+TEST(HostControlProtocolTest, PipeServerCreatesFifoPairAndCleansUpOnClose)
+{
+	const auto base_path = make_temp_pipe_base_path();
+	const auto slash = base_path.find_last_of('/');
+	ASSERT_NE(slash, std::string::npos);
+	const auto pipe_dir = base_path.substr(0, slash);
+	const auto input_path = base_path + ".in";
+	const auto output_path = base_path + ".out";
+
+	host_control::PipeServer server = {};
+	std::string error = {};
+	ASSERT_TRUE(host_control::open_pipe_server(base_path, server, error)) << error;
+	EXPECT_EQ(access(input_path.c_str(), F_OK), 0);
+	EXPECT_EQ(access(output_path.c_str(), F_OK), 0);
+
+	struct stat input_stat = {};
+	struct stat output_stat = {};
+	ASSERT_EQ(stat(input_path.c_str(), &input_stat), 0);
+	ASSERT_EQ(stat(output_path.c_str(), &output_stat), 0);
+	EXPECT_TRUE(S_ISFIFO(input_stat.st_mode));
+	EXPECT_TRUE(S_ISFIFO(output_stat.st_mode));
+
+	host_control::close_pipe_server(server);
+	EXPECT_NE(access(input_path.c_str(), F_OK), 0);
+	EXPECT_NE(access(output_path.c_str(), F_OK), 0);
+	EXPECT_EQ(rmdir(pipe_dir.c_str()), 0);
+}
+
+TEST(HostControlProtocolTest, PipeSessionAcceptsInputWhileExecIsRunning)
+{
+	host_control::clear_queued_input();
+	int client_to_server[2] = {-1, -1};
+	int server_to_client[2] = {-1, -1};
+	ASSERT_EQ(pipe(client_to_server), 0);
+	ASSERT_EQ(pipe(server_to_client), 0);
+
+	std::promise<void> exec_started;
+	std::promise<void> allow_exec_finish;
+	auto exec_started_future = exec_started.get_future();
+	auto allow_exec_finish_future = allow_exec_finish.get_future();
+	std::thread server;
+	PipeSessionTestCleanup cleanup(
+	        allow_exec_finish, client_to_server, server_to_client, server);
+
+	server = std::thread([&]() {
+		(void)host_control::run_control_pipe_session(
+		        {host_control::Transport::Pipe, "/tmp/test.pipe"},
+		        client_to_server[0],
+		        server_to_client[1],
+		        [&](const host_control::Request &, host_control::CommandResult &result) {
+			        exec_started.set_value();
+			        allow_exec_finish_future.wait();
+			        result.shell_exit = false;
+			        result.errorlevel = 0;
+			        result.drive = "Z";
+			        result.cwd = "Z:\\";
+			        return true;
+		        });
+	});
+
+	auto read_line = [&](std::string &line) {
+		line.clear();
+		for (;;) {
+			char byte = 0;
+			const auto received = read(server_to_client[0], &byte, 1);
+			if (received <= 0) {
+				return false;
+			}
+			if (byte == '\n') {
+				return true;
+			}
+			line += byte;
+		}
+	};
+
+	std::string line = {};
+	ASSERT_TRUE(read_line(line));
+	EXPECT_NE(line.find(R"("event":"ready")"), std::string::npos);
+	EXPECT_NE(line.find(R"("transport":"pipe")"), std::string::npos);
+
+	const std::string exec_request = R"({"id":"1","op":"exec","command":"hang"})" "\n";
+	ASSERT_EQ(write(client_to_server[1], exec_request.data(), exec_request.size()),
+	          static_cast<ssize_t>(exec_request.size()));
+	ASSERT_EQ(exec_started_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+
+	const std::string input_request = R"({"id":"2","op":"input_text","text":"dir\n"})" "\n";
+	ASSERT_EQ(write(client_to_server[1], input_request.data(), input_request.size()),
+	          static_cast<ssize_t>(input_request.size()));
+
+	ASSERT_TRUE(read_line(line));
+	EXPECT_NE(line.find(R"("event":"input_result")"), std::string::npos);
+	EXPECT_NE(line.find(R"("id":"2")"), std::string::npos);
+
+	cleanup.release_exec();
+	ASSERT_TRUE(read_line(line));
+	EXPECT_NE(line.find(R"("event":"result")"), std::string::npos);
+	EXPECT_NE(line.find(R"("id":"1")"), std::string::npos);
 }
 #endif
 

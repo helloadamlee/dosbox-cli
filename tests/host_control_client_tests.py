@@ -1,9 +1,11 @@
 import importlib.util
+import errno
 import io
 import json
 import os
 import signal
 import socket
+import select
 import subprocess
 import sys
 import tempfile
@@ -125,6 +127,67 @@ class HostControlClientTest(unittest.TestCase):
                     next_response += 1
 
         thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(2.0))
+        return thread
+
+    def _serve_pipe_workflow(self, base_path, response_lines, requests, expected_requests):
+        ready = threading.Event()
+        stop = threading.Event()
+        input_path = f"{base_path}.in"
+        output_path = f"{base_path}.out"
+        os.mkfifo(input_path)
+        os.mkfifo(output_path)
+
+        def read_request(fd):
+            data = b""
+            deadline = time.monotonic() + 2.0
+            while not data.endswith(b"\n") and time.monotonic() < deadline:
+                readable, _, _ = select.select([fd], [], [], 0.05)
+                if not readable:
+                    continue
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                data += chunk
+            return data.decode("utf-8")
+
+        def serve():
+            read_fd = -1
+            write_fd = -1
+            try:
+                read_fd = os.open(input_path, os.O_RDONLY | os.O_NONBLOCK)
+                ready.set()
+                deadline = time.monotonic() + 2.0
+                while write_fd < 0 and time.monotonic() < deadline and not stop.is_set():
+                    try:
+                        write_fd = os.open(output_path, os.O_WRONLY | os.O_NONBLOCK)
+                    except OSError as exc:
+                        if exc.errno != errno.ENXIO:
+                            raise
+                        time.sleep(0.01)
+                if write_fd < 0:
+                    return
+                for line in response_lines[:1]:
+                    os.write(write_fd, line.encode("utf-8"))
+                next_response = 1
+                for _ in range(expected_requests):
+                    data = read_request(read_fd)
+                    requests.append(data)
+                    if next_response < len(response_lines):
+                        os.write(write_fd, response_lines[next_response].encode("utf-8"))
+                        next_response += 1
+                while next_response < len(response_lines):
+                    os.write(write_fd, response_lines[next_response].encode("utf-8"))
+                    next_response += 1
+            finally:
+                if read_fd >= 0:
+                    os.close(read_fd)
+                if write_fd >= 0:
+                    os.close(write_fd)
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.stop = stop
         thread.start()
         self.assertTrue(ready.wait(2.0))
         return thread
@@ -442,6 +505,29 @@ class HostControlClientTest(unittest.TestCase):
         self.assertEqual(args.action, "workflow")
         self.assertEqual(args.command, "recipe.json")
 
+    def test_parse_args_accepts_pipe_workflow_and_transcript(self):
+        module = load_client_module()
+
+        args = module.parse_args(
+            [
+                "--timeout",
+                "2.5",
+                "--transcript",
+                "run.jsonl",
+                "pipe",
+                "/tmp/dosboxx-control",
+                "workflow",
+                "recipe.json",
+            ]
+        )
+
+        self.assertEqual(args.timeout, 2.5)
+        self.assertEqual(args.transcript, "run.jsonl")
+        self.assertEqual(args.transport, "pipe")
+        self.assertEqual(args.path, "/tmp/dosboxx-control")
+        self.assertEqual(args.action, "workflow")
+        self.assertEqual(args.command, "recipe.json")
+
     def test_socket_workflow_runs_requests_in_sequence(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             sock_path = str(Path(tmpdir) / "control.sock")
@@ -488,6 +574,122 @@ class HostControlClientTest(unittest.TestCase):
                     '{"id":"4","op":"key","key":"enter"}\n',
                 ],
             )
+
+    def test_pipe_status_one_shot_preserves_raw_lines(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("POSIX FIFOs are unavailable on this platform")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = str(Path(tmpdir) / "control")
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"pipe","endpoint":"%s"}\n' % base_path,
+                '{"event":"status","id":"1","transport":"pipe","session_active":true,"errorlevel":0,"drive":"Z","cwd":"Z:\\\\"}\n',
+            ]
+            thread = self._serve_pipe_workflow(base_path, lines, requests, expected_requests=1)
+
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "pipe", base_path, "status"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.stop.set()
+            thread.join(timeout=2)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertEqual(requests, ['{"id":"1","op":"status"}\n'])
+
+    def test_pipe_workflow_runs_requests_in_sequence(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("POSIX FIFOs are unavailable on this platform")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = str(Path(tmpdir) / "control")
+            recipe_path = self._write_recipe(
+                tmpdir,
+                {
+                    "steps": [
+                        {"exec": "dir"},
+                        {"status": True},
+                        {"input_text": "dir\n"},
+                        {"key": "enter"},
+                    ]
+                },
+            )
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"pipe","endpoint":"%s"}\n' % base_path,
+                '{"event":"result","id":"1","ok":true,"shell_exit":false,"errorlevel":0,"drive":"Z","cwd":"Z:\\\\","duration_ms":1}\n',
+                '{"event":"status","id":"2","transport":"pipe","session_active":true,"errorlevel":0,"drive":"Z","cwd":"Z:\\\\"}\n',
+                '{"event":"input_result","id":"3","ok":true,"queued":4}\n',
+                '{"event":"input_result","id":"4","ok":true,"queued":1}\n',
+            ]
+            thread = self._serve_pipe_workflow(base_path, lines, requests, expected_requests=4)
+
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "pipe", base_path, "workflow", str(recipe_path)],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            thread.stop.set()
+            thread.join(timeout=2)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertEqual(
+                requests,
+                [
+                    '{"id":"1","op":"exec","command":"dir"}\n',
+                    '{"id":"2","op":"status"}\n',
+                    '{"id":"3","op":"input_text","text":"dir\\n"}\n',
+                    '{"id":"4","op":"key","key":"enter"}\n',
+                ],
+            )
+
+    def test_pipe_missing_endpoint_reports_useful_diagnostic(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(CLIENT),
+                "pipe",
+                "/tmp/dosboxx-missing-pipe-endpoint",
+                "status",
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("failed to open pipe transport", proc.stderr)
+        self.assertIn("/tmp/dosboxx-missing-pipe-endpoint", proc.stderr)
+
+    def test_pipe_stale_fifo_without_server_exits_promptly(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("POSIX FIFOs are unavailable on this platform")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = str(Path(tmpdir) / "control")
+            os.mkfifo(f"{base_path}.in")
+            os.mkfifo(f"{base_path}.out")
+
+            try:
+                proc = subprocess.run(
+                    [sys.executable, str(CLIENT), "pipe", base_path, "status"],
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=1.0,
+                )
+            except subprocess.TimeoutExpired:
+                self.fail("pipe client blocked opening stale FIFOs without a server")
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("failed to open pipe transport", proc.stderr)
 
     def test_socket_workflow_interactive_exec_sends_input_before_result(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -752,7 +954,7 @@ class HostControlClientTest(unittest.TestCase):
             )
 
             self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("input_text actions are socket-only", proc.stderr)
+            self.assertIn("input_text actions require socket or pipe transport", proc.stderr)
             self.assertNotIn("should not spawn", proc.stderr)
 
     def test_stdio_workflow_rejects_interactive_exec_before_spawn(self):
@@ -790,7 +992,10 @@ class HostControlClientTest(unittest.TestCase):
             )
 
             self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("exec_interactive actions are socket-only", proc.stderr)
+            self.assertIn(
+                "exec_interactive actions require socket or pipe transport",
+                proc.stderr,
+            )
             self.assertNotIn("should not spawn", proc.stderr)
 
     def test_socket_workflow_writes_jsonl_transcript_without_changing_stdout(self):
@@ -1231,7 +1436,7 @@ class HostControlClientTest(unittest.TestCase):
         )
 
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("input actions are socket-only", proc.stderr)
+        self.assertIn("input actions require socket or pipe transport", proc.stderr)
 
     def test_stdio_rejects_key_as_socket_only(self):
         proc = subprocess.run(
@@ -1254,7 +1459,7 @@ class HostControlClientTest(unittest.TestCase):
         )
 
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("input actions are socket-only", proc.stderr)
+        self.assertIn("input actions require socket or pipe transport", proc.stderr)
 
 
 if __name__ == "__main__":
