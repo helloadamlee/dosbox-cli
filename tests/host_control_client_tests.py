@@ -890,6 +890,44 @@ class HostControlClientTest(unittest.TestCase):
             self.assertEqual([entry["raw"] for entry in entries], lines)
             self.assertEqual(entries[-1]["event"]["event"], "result")
 
+    def test_committed_host_control_recipes_parse(self):
+        recipe_paths = sorted((REPO_ROOT / "examples" / "host-control").rglob("*.json"))
+        self.assertTrue(recipe_paths, "expected committed host-control recipe examples")
+
+        client = load_client_module()
+        for recipe_path in recipe_paths:
+            with self.subTest(recipe=str(recipe_path.relative_to(REPO_ROOT))):
+                client.load_workflow_recipe(recipe_path)
+
+    def test_committed_hangtime_recipes_do_not_hardcode_local_project_path(self):
+        recipe_paths = sorted(
+            (REPO_ROOT / "examples" / "host-control" / "hangtime").rglob("*.json")
+        )
+        self.assertTrue(recipe_paths, "expected committed Hangtime recipe examples")
+
+        for recipe_path in recipe_paths:
+            with self.subTest(recipe=str(recipe_path.relative_to(REPO_ROOT))):
+                recipe_text = recipe_path.read_text(encoding="utf-8")
+                self.assertNotIn("/home/fld/Projects/hangtime", recipe_text)
+
+    def test_committed_recipes_do_not_wait_for_result_after_plain_exec(self):
+        recipe_paths = sorted((REPO_ROOT / "examples" / "host-control").rglob("*.json"))
+        self.assertTrue(recipe_paths, "expected committed host-control recipe examples")
+
+        for recipe_path in recipe_paths:
+            recipe = json.loads(recipe_path.read_text(encoding="utf-8"))
+            steps = recipe["steps"]
+            for index, step in enumerate(steps[:-1]):
+                next_step = steps[index + 1]
+                with self.subTest(recipe=str(recipe_path.relative_to(REPO_ROOT)), step=index):
+                    if "exec" not in step or "wait_for" not in next_step:
+                        continue
+                    self.assertNotEqual(next_step["wait_for"], "result")
+                    self.assertNotEqual(
+                        next_step["wait_for"],
+                        {"event": "result", "ok": True},
+                    )
+
     def test_parse_rejects_non_positive_timeout(self):
         proc = subprocess.run(
             [sys.executable, str(CLIENT), "--timeout", "0", "socket", "/tmp/d.sock", "status"],

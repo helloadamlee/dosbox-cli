@@ -160,6 +160,23 @@ scripts/host_control_client.py --timeout 10 --transcript run.jsonl socket /tmp/d
 scripts/host_control_client.py --timeout 10 stdio workflow recipe.json -- ./src/dosbox-x -control-stdio -headless -noconfig -noautoexec
 ```
 
+Committed examples live under `examples/host-control/`:
+
+- `status.json` reads session status.
+- `interactive-dir.json` runs `dir` with `exec_interactive` so output is
+  captured.
+- `mount-current-dir-and-list.json` mounts the DOSBox-X process working
+  directory as `C:` and lists it.
+- `hangtime/status.json` and `hangtime/list-project-root.json` are NBA
+  Hangtime project examples. They avoid local absolute paths; run DOSBox-X with
+  the Hangtime project root as its current working directory.
+
+Example socket run with a transcript:
+
+```bash
+scripts/host_control_client.py --timeout 10 --transcript run.jsonl socket /tmp/dosboxx.sock workflow examples/host-control/interactive-dir.json
+```
+
 Recipe files are JSON only and use a top-level `steps` array:
 
 ```json
@@ -167,7 +184,7 @@ Recipe files are JSON only and use a top-level `steps` array:
   "steps": [
     {"comment": "Mount and inspect a project"},
     {"exec": "mount c /home/me/project"},
-    {"wait_for": {"event": "result", "ok": true}},
+    {"exec": "c:"},
     {"status": true},
     {"input_text": "dir\n"},
     {"key": "enter"},
@@ -243,6 +260,24 @@ events:
 Workflow failures exit nonzero and write diagnostics to stderr. Timeout and
 server-error diagnostics include the failing step index, action name, the error,
 and recent raw events so an agent can report useful context.
+
+### Live recipe smokes
+
+Live host-control tests are opt-in:
+
+```bash
+DOSBOX_X_LIVE_TESTS=1 DOSBOX_X_BINARY=./src/dosbox-x python3 -m unittest tests.host_control_live_tests
+```
+
+Recipe smokes always pass `--transcript` and preserve transcript/server-log
+artifacts in a temporary directory. Failure diagnostics include the recipe path,
+transcript path, recent events, client stderr, and server stdout/stderr.
+
+The Hangtime recipe smoke is additionally gated on `HANGTIME_PROJECT_ROOT`:
+
+```bash
+DOSBOX_X_LIVE_TESTS=1 DOSBOX_X_BINARY=./src/dosbox-x HANGTIME_PROJECT_ROOT=/path/to/XCODE101L python3 -m unittest tests.host_control_live_tests.HostControlLiveTest.test_socket_hangtime_project_recipe_lists_project_root
+```
 
 REPL commands:
 

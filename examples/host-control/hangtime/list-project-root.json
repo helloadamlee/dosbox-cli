@@ -1,0 +1,29 @@
+{
+  "steps": [
+    {
+      "comment": "Run DOSBox-X from the NBA Hangtime project root, mount it as C:, and list the root."
+    },
+    {
+      "exec": "mount c ."
+    },
+    {
+      "exec": "c:"
+    },
+    {
+      "exec_interactive": {
+        "command": "dir",
+        "steps": [
+          {
+            "wait_for": "output"
+          },
+          {
+            "wait_for": {
+              "event": "result",
+              "ok": true
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

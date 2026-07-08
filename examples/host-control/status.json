@@ -1,0 +1,10 @@
+{
+  "steps": [
+    {
+      "comment": "Read the current DOSBox-X host-control session status."
+    },
+    {
+      "status": true
+    }
+  ]
+}

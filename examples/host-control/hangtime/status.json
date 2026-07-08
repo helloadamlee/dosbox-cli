@@ -1,0 +1,10 @@
+{
+  "steps": [
+    {
+      "comment": "Run from the NBA Hangtime project root and confirm host-control status."
+    },
+    {
+      "status": true
+    }
+  ]
+}
