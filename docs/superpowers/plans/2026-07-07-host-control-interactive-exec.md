@@ -14,7 +14,7 @@
 
 - Modify `scripts/host_control_client.py`: add `exec_interactive` parsing, recursive nested-step validation, workflow runtime with pending events and request completion tracking, socket-only validation, and interactive execution.
 - Modify `tests/host_control_client_tests.py`: add parser, transport validation, request-ordering, out-of-order completion, timeout, and transcript regression tests.
-- Modify `tests/host_control_live_tests.py`: add a gated `pause` interactive workflow smoke if stable.
+- Modify `tests/host_control_live_tests.py`: add a gated interactive workflow smoke using a stable output-producing command.
 - Modify `docs/host-control.md`: document `exec_interactive`, socket-only behavior, and idle-prompt output limitation.
 
 ---
@@ -64,7 +64,7 @@
 ### Task 6: Docs And Live Smoke
 
 - [ ] Update `docs/host-control.md` with `exec_interactive` recipe examples and the idle-prompt output limitation.
-- [ ] Add a gated live workflow smoke for `pause` if it is stable with the current binary.
+- [ ] Add a gated live workflow smoke for `exec_interactive` with `dir`, while keeping input-during-exec covered by fake socket tests.
 - [ ] Run `python3 -m unittest tests.host_control_client_tests`.
 - [ ] Run `DOSBOX_X_LIVE_TESTS=1 python3 -m unittest tests.host_control_live_tests` if the binary is available.
 - [ ] Run `./src/dosbox-x -tests --gtest_filter='*HostControl*'`.

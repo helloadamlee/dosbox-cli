@@ -36,7 +36,7 @@ Not included:
   "steps": [
     {
       "exec_interactive": {
-        "command": "pause",
+        "command": "setup.exe",
         "steps": [
           {"wait_for": "output"},
           {"key": "enter"},
@@ -121,6 +121,7 @@ Python client tests should cover:
 - interactive timeout diagnostics include nested context and recent events
 - transcript output remains unchanged
 
-Live tests should stay gated behind `DOSBOX_X_LIVE_TESTS=1`. A practical live
-smoke is `exec_interactive` with `pause`, wait for output, send `enter`, and
-observe `result`.
+Live tests should stay gated behind `DOSBOX_X_LIVE_TESTS=1`. A stable live smoke
+can use `exec_interactive` with `dir`, wait for output, and observe `result`.
+The input-during-exec path is covered by fake socket tests where event ordering
+can be controlled deterministically.

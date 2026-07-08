@@ -180,6 +180,9 @@ Recipe files are JSON only and use a top-level `steps` array:
 Supported steps:
 
 - `{"exec":"command"}` sends an `exec` request and waits for `result`
+- `{"exec_interactive":{"command":"setup.exe","steps":[...]}}` sends an `exec`
+  request, runs nested workflow steps while that command is active, and then
+  ensures the command reaches `result`
 - `{"status":true}` sends a `status` request and waits for `status`
 - `{"input_text":"text"}` sends an `input_text` request and waits for
   `input_result`
@@ -196,8 +199,38 @@ mode does not decode output, run regular expressions, or support variables,
 conditionals, loops, or parallel steps.
 
 Socket workflows may use every step type. Stdio workflows reject `input_text`
-and `key` steps before spawning DOSBox-X because host-control input injection is
-socket-only.
+`key`, and `exec_interactive` steps before spawning DOSBox-X because
+host-control input injection is socket-only.
+
+Use `exec_interactive` for commands or programs that need input while their
+output is being captured:
+
+```json
+{
+  "steps": [
+    {
+      "exec_interactive": {
+        "command": "setup.exe",
+        "steps": [
+          {"wait_for": "output"},
+          {"key": "enter"},
+          {"wait_for": {"event": "result", "ok": true}}
+        ]
+      }
+    }
+  ]
+}
+```
+
+Nested `exec_interactive` steps support `wait_for`, `input_text`, `key`,
+`status`, comments, and no-ops. Nested request ids continue from the same
+monotonic workflow sequence as top-level steps.
+
+Keyboard input queued at the idle DOS prompt can be accepted, but it does not
+currently produce host-control `output` events unless an `exec` output-capture
+context is active. If a workflow needs to wait on output from a prompt,
+installer, or menu, run that program with `exec_interactive` and send input from
+inside its nested steps.
 
 When `--transcript <path>` is provided, workflow mode writes one JSON object per
 event to the JSONL transcript while preserving stdout exactly as raw server
