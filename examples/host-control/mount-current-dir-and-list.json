@@ -1,0 +1,29 @@
+{
+  "steps": [
+    {
+      "comment": "Run DOSBox-X from a project directory, mount that directory as C:, and list it."
+    },
+    {
+      "exec": "mount c ."
+    },
+    {
+      "exec": "c:"
+    },
+    {
+      "exec_interactive": {
+        "command": "dir",
+        "steps": [
+          {
+            "wait_for": "output"
+          },
+          {
+            "wait_for": {
+              "event": "result",
+              "ok": true
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

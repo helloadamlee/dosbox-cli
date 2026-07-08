@@ -1,0 +1,23 @@
+{
+  "steps": [
+    {
+      "comment": "Run DIR as an interactive exec so output events are captured."
+    },
+    {
+      "exec_interactive": {
+        "command": "dir",
+        "steps": [
+          {
+            "wait_for": "output"
+          },
+          {
+            "wait_for": {
+              "event": "result",
+              "ok": true
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
