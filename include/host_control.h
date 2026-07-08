@@ -70,6 +70,15 @@ struct SocketServer {
 	bool created_path = false;
 };
 
+struct PipeServer {
+	int input_fd = -1;
+	std::string base_path = {};
+	std::string input_path = {};
+	std::string output_path = {};
+	bool created_input_path = false;
+	bool created_output_path = false;
+};
+
 using ReadLineFn = std::function<bool(std::string &)>;
 using WriteLineFn = std::function<bool(const std::string &)>;
 using ExecRequestFn = std::function<bool(const Request &, CommandResult &)>;
@@ -148,10 +157,16 @@ SessionResult run_control_session(const Options &options,
 SessionResult run_control_socket_session(const Options &options,
                                          int client_fd,
                                          const ExecRequestFn &exec_request);
+SessionResult run_control_pipe_session(const Options &options,
+                                       int read_fd,
+                                       int write_fd,
+                                       const ExecRequestFn &exec_request);
 bool run_stdio_shell();
 bool run_pipe_shell();
 bool open_socket_server(const std::string &path, SocketServer &server, std::string &error);
 void close_socket_server(SocketServer &server);
+bool open_pipe_server(const std::string &path, PipeServer &server, std::string &error);
+void close_pipe_server(PipeServer &server);
 bool run_socket_shell();
 bool build_input_codes_for_text(const std::string &text,
                                 std::vector<uint16_t> &codes,

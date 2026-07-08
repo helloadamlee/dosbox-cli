@@ -173,7 +173,9 @@ def validate_workflow_steps_for_transport(steps, allow_input, prefix="step"):
     for index, step in enumerate(steps):
         step_name = f"{prefix} {index}" if prefix == "step" else f"{prefix}.{index}"
         if not allow_input and step.action in ("input_text", "key", "exec_interactive"):
-            raise WorkflowError(f"{step_name}: {step.action} actions are socket-only")
+            raise WorkflowError(
+                f"{step_name}: {step.action} actions require socket or pipe transport"
+            )
         if step.action == "exec_interactive":
             validate_workflow_steps_for_transport(
                 step.value["steps"],
@@ -274,6 +276,45 @@ class SocketTransport(BufferedLineTransport):
 
     def close(self):
         self.socket.close()
+
+    def abort(self):
+        self.close()
+
+
+class PipeTransport(BufferedLineTransport):
+    def __init__(self, path):
+        super().__init__()
+        if os.name == "nt":
+            raise OSError("pipe transport is unsupported on this platform")
+
+        self.path = path
+        self.input_path = f"{path}.in"
+        self.output_path = f"{path}.out"
+        self.read_fd = -1
+        self.write_fd = -1
+        try:
+            self.read_fd = os.open(self.output_path, os.O_RDONLY | os.O_NONBLOCK)
+            self.write_fd = os.open(self.input_path, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            self.close()
+            raise OSError(f"failed to open pipe transport {path}: {exc}") from exc
+
+    def read_bytes(self):
+        return os.read(self.read_fd, 4096)
+
+    def fileno(self):
+        return self.read_fd
+
+    def writeline(self, line):
+        os.write(self.write_fd, line.encode("utf-8") + b"\n")
+
+    def close(self):
+        if self.write_fd >= 0:
+            os.close(self.write_fd)
+            self.write_fd = -1
+        if self.read_fd >= 0:
+            os.close(self.read_fd)
+            self.read_fd = -1
 
     def abort(self):
         self.close()
@@ -449,7 +490,7 @@ def run_repl(transport, timeout=None, allow_input=True):
             continue
 
         if op in ("input_text", "key") and not allow_input:
-            sys.stderr.write("input actions are socket-only\n")
+            sys.stderr.write("input actions require socket or pipe transport\n")
             sys.stderr.flush()
             continue
 
@@ -571,11 +612,11 @@ class WorkflowRuntime:
                 self.run_request("status")
             elif step.action == "input_text":
                 if not self.allow_input:
-                    raise WorkflowError("input_text actions are socket-only")
+                    raise WorkflowError("input_text actions require socket or pipe transport")
                 self.run_request("input_text", text=step.value)
             elif step.action == "key":
                 if not self.allow_input:
-                    raise WorkflowError("key actions are socket-only")
+                    raise WorkflowError("key actions require socket or pipe transport")
                 self.run_request("key", key=step.value)
             elif step.action == "wait_for":
                 self.wait_for_event(step.value)
@@ -600,7 +641,7 @@ class WorkflowRuntime:
 
     def run_exec_interactive(self, step, step_context):
         if not self.allow_input:
-            raise WorkflowError("exec_interactive actions are socket-only")
+            raise WorkflowError("exec_interactive actions require socket or pipe transport")
         request_id = self.send_request("exec", command=step.value["command"])
         self.run_steps(
             step.value["steps"],
@@ -651,6 +692,14 @@ def parse_args(argv):
     )
     socket_parser.add_argument("command", nargs="?")
 
+    pipe_parser = subparsers.add_parser("pipe")
+    pipe_parser.add_argument("path")
+    pipe_parser.add_argument(
+        "action",
+        choices=("status", "exec", "input-text", "key", "repl", "workflow"),
+    )
+    pipe_parser.add_argument("command", nargs="?")
+
     stdio_parser = subparsers.add_parser("stdio")
     stdio_parser.add_argument(
         "action",
@@ -665,7 +714,7 @@ def parse_args(argv):
         parser.error("timeout must be greater than zero")
 
     if args.transport == "stdio" and args.action in ("input-text", "key"):
-        parser.error("input actions are socket-only")
+        parser.error("input actions require socket or pipe transport")
     if args.action in ("input-text", "key") and not args.command:
         parser.error(f"{args.action} requires a value")
     if args.action == "workflow" and not args.command:
@@ -695,6 +744,8 @@ def parse_args(argv):
 def make_transport(args):
     if args.transport == "socket":
         return SocketTransport(args.path)
+    if args.transport == "pipe":
+        return PipeTransport(args.path)
     return StdioTransport(args.spawn_command)
 
 
@@ -707,7 +758,7 @@ def main(argv=None):
             workflow_steps = load_workflow_recipe(args.command)
             validate_workflow_for_transport(
                 workflow_steps,
-                allow_input=args.transport == "socket",
+                allow_input=args.transport in ("socket", "pipe"),
             )
             if args.transcript is not None:
                 transcript = open(args.transcript, "w", encoding="utf-8")
@@ -729,13 +780,17 @@ def main(argv=None):
     aborted = False
     try:
         if args.action == "repl":
-            return run_repl(transport, args.timeout, allow_input=args.transport == "socket")
+            return run_repl(
+                transport,
+                args.timeout,
+                allow_input=args.transport in ("socket", "pipe"),
+            )
         if args.action == "workflow":
             return run_workflow(
                 transport,
                 workflow_steps,
                 args.timeout,
-                allow_input=args.transport == "socket",
+                allow_input=args.transport in ("socket", "pipe"),
                 transcript=transcript,
             )
         if args.action == "input-text":

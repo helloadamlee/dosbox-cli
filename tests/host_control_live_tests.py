@@ -419,6 +419,147 @@ class HostControlLiveTest(unittest.TestCase):
             recent_events=recent_events,
         )
 
+    def run_pipe_recipe(self, recipe_path, timeout_seconds=10, server_cwd=None):
+        artifact_dir = Path(tempfile.mkdtemp(prefix="dosbox-x-host-control-pipe-"))
+        pipe_base = artifact_dir / "control"
+        input_path = Path(f"{pipe_base}.in")
+        output_path = Path(f"{pipe_base}.out")
+        transcript_path = artifact_dir / "transcript.jsonl"
+        stdout_path = artifact_dir / "server.stdout"
+        stderr_path = artifact_dir / "server.stderr"
+        server_cwd = None if server_cwd is None else Path(server_cwd)
+        with stdout_path.open("w", encoding="utf-8") as server_stdout, stderr_path.open(
+            "w", encoding="utf-8"
+        ) as server_stderr:
+            server = subprocess.Popen(
+                [
+                    str(self.dosbox_x),
+                    "-control-pipe",
+                    str(pipe_base),
+                    "-headless",
+                    "-noconfig",
+                    "-noautoexec",
+                ],
+                cwd=server_cwd,
+                stdout=server_stdout,
+                stderr=server_stderr,
+                text=True,
+            )
+            try:
+                deadline = time.monotonic() + timeout_seconds
+                while time.monotonic() < deadline and not (
+                    input_path.exists() and output_path.exists()
+                ):
+                    if server.poll() is not None:
+                        server_stdout.flush()
+                        server_stderr.flush()
+                        server_stdout_text, server_stderr_text = self.read_server_logs(
+                            stdout_path, stderr_path
+                        )
+                        self.fail(
+                            "server exited before creating pipe FIFOs\n"
+                            + self.recipe_diagnostics(
+                                recipe_path,
+                                transcript_path,
+                                server_stdout=server_stdout_text,
+                                server_stderr=server_stderr_text,
+                            )
+                        )
+                    time.sleep(0.05)
+                if not (input_path.exists() and output_path.exists()):
+                    server_stdout.flush()
+                    server_stderr.flush()
+                    server_stdout_text, server_stderr_text = self.read_server_logs(
+                        stdout_path, stderr_path
+                    )
+                    self.fail(
+                        "pipe FIFOs were not created\n"
+                        + self.recipe_diagnostics(
+                            recipe_path,
+                            transcript_path,
+                            server_stdout=server_stdout_text,
+                            server_stderr=server_stderr_text,
+                        )
+                    )
+
+                try:
+                    proc = subprocess.run(
+                        [
+                            sys.executable,
+                            str(CLIENT),
+                            "--timeout",
+                            str(timeout_seconds),
+                            "--transcript",
+                            str(transcript_path),
+                            "pipe",
+                            str(pipe_base),
+                            "workflow",
+                            str(recipe_path),
+                        ],
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=timeout_seconds + 5,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    server_stdout.flush()
+                    server_stderr.flush()
+                    server_stdout_text, server_stderr_text = self.read_server_logs(
+                        stdout_path, stderr_path
+                    )
+                    timeout_proc = subprocess.CompletedProcess(
+                        exc.cmd,
+                        -1,
+                        stdout=exc.stdout or "",
+                        stderr=exc.stderr or "",
+                    )
+                    self.fail(
+                        f"client timed out after {exc.timeout} seconds\n"
+                        + self.recipe_diagnostics(
+                            recipe_path,
+                            transcript_path,
+                            proc=timeout_proc,
+                            server_stdout=server_stdout_text,
+                            server_stderr=server_stderr_text,
+                            recent_events=self.read_recent_transcript_events(
+                                transcript_path
+                            ),
+                        )
+                    )
+            finally:
+                if server.poll() is None:
+                    server.terminate()
+                    try:
+                        server.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        server.kill()
+                        server.wait()
+                server_stdout.flush()
+                server_stderr.flush()
+            server_stdout_text, server_stderr_text = self.read_server_logs(
+                stdout_path, stderr_path
+            )
+
+        recent_events = self.read_recent_transcript_events(transcript_path)
+        events = self.parse_events(
+            proc,
+            server_stdout_text,
+            server_stderr_text,
+            recipe_path=recipe_path,
+            transcript_path=transcript_path,
+            recent_events=recent_events,
+        )
+        return ReplResult(
+            proc,
+            events,
+            server_stdout_text,
+            server_stderr_text,
+            recipe_path=recipe_path,
+            transcript_path=transcript_path,
+            recent_events=recent_events,
+        )
+
     def run_socket_workflow(self, recipe, timeout_seconds=10):
         artifact_dir = Path(tempfile.mkdtemp(prefix="dosbox-x-host-control-workflow-"))
         recipe_path = artifact_dir / "recipe.json"
@@ -494,6 +635,19 @@ class HostControlLiveTest(unittest.TestCase):
 
     def test_socket_status_recipe_runs(self):
         result = self.run_socket_recipe(EXAMPLE_RECIPES / "status.json", timeout_seconds=10)
+
+        self.assertEqual(result.proc.returncode, 0, result.diagnostics())
+        self.assertTrue(result.transcript_path.exists(), result.diagnostics())
+        self.assertTrue(
+            any(event.get("event") == "status" for event in result.events),
+            result.diagnostics(),
+        )
+
+    def test_pipe_status_recipe_runs(self):
+        if os.name == "nt":
+            raise unittest.SkipTest("pipe transport is Unix FIFO-only in this milestone")
+
+        result = self.run_pipe_recipe(EXAMPLE_RECIPES / "status.json", timeout_seconds=10)
 
         self.assertEqual(result.proc.returncode, 0, result.diagnostics())
         self.assertTrue(result.transcript_path.exists(), result.diagnostics())

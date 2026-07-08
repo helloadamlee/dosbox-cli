@@ -29,7 +29,21 @@ path when the session ends.
 
 ### Pipe
 
-`-control-pipe <path>` is parsed, but pipe transport is not implemented yet. It exits the host-control startup path with a clear stderr message instead of starting a normal interactive shell.
+Start DOSBox-X with `-control-pipe <base-path>`:
+
+```bash
+./src/dosbox-x -control-pipe /tmp/dosboxx-control -headless -noconfig -noautoexec
+```
+
+On Unix-like platforms, DOSBox-X creates two FIFOs from the base path:
+
+- `/tmp/dosboxx-control.in` receives client requests.
+- `/tmp/dosboxx-control.out` sends server events.
+
+The server removes both FIFO paths when the host-control session ends. Windows
+named pipes such as `\\.\pipe\dosbox-x-control` are not implemented in this
+milestone; `-control-pipe` reports that pipe transport is unsupported on
+non-Unix platforms.
 
 ## Requests
 
@@ -59,7 +73,7 @@ Queue a named key:
 {"id":"8","op":"key","key":"enter"}
 ```
 
-`input_text` and `key` are socket-only in Milestone 4. `input_text` accepts
+`input_text` and `key` require socket or pipe transport. `input_text` accepts
 printable ASCII; `\r` and `\n` are normalized to Enter. Non-ASCII text is
 rejected. Supported keys are `enter`, `escape`, `tab`, `backspace`, `up`,
 `down`, `left`, and `right`.
@@ -124,6 +138,16 @@ scripts/host_control_client.py socket /tmp/dosboxx.sock key enter
 scripts/host_control_client.py socket /tmp/dosboxx.sock repl
 ```
 
+For pipe mode, start DOSBox-X separately with `-control-pipe <base-path>`, then
+attach the client to the same base path:
+
+```bash
+scripts/host_control_client.py pipe /tmp/dosboxx-control status
+scripts/host_control_client.py pipe /tmp/dosboxx-control exec "echo hi"
+scripts/host_control_client.py pipe /tmp/dosboxx-control workflow examples/host-control/status.json
+scripts/host_control_client.py pipe /tmp/dosboxx-control repl
+```
+
 For stdio mode, the client spawns DOSBox-X. The spawned command must include
 `-control-stdio`:
 
@@ -138,14 +162,15 @@ waits for each protocol response:
 
 ```bash
 scripts/host_control_client.py --timeout 5 socket /tmp/dosboxx.sock exec "echo hi"
+scripts/host_control_client.py --timeout 5 pipe /tmp/dosboxx-control exec "echo hi"
 scripts/host_control_client.py --timeout 5 stdio status -- ./src/dosbox-x -control-stdio -headless -noconfig -noautoexec
 ```
 
 Timeouts are a client-side recovery feature. In stdio mode, the client owns the
-spawned DOSBox-X process and terminates it on timeout. In socket mode, the client
-closes its socket; DOSBox-X may continue the current DOS command until it
-returns. Socket input requests remain responsive while an `exec` request is
-running.
+spawned DOSBox-X process and terminates it on timeout. In socket and pipe modes,
+the client closes its endpoint; DOSBox-X may continue the current DOS command
+until it returns. Socket and pipe input requests remain responsive while an
+`exec` request is running.
 
 The client writes raw JSON events to stdout. REPL prompts and local help are
 written to stderr so stdout remains machine-readable.
@@ -157,6 +182,7 @@ Workflow mode runs a JSON recipe with sequential host-control steps:
 ```bash
 scripts/host_control_client.py --timeout 10 socket /tmp/dosboxx.sock workflow recipe.json
 scripts/host_control_client.py --timeout 10 --transcript run.jsonl socket /tmp/dosboxx.sock workflow recipe.json
+scripts/host_control_client.py --timeout 10 --transcript run.jsonl pipe /tmp/dosboxx-control workflow recipe.json
 scripts/host_control_client.py --timeout 10 stdio workflow recipe.json -- ./src/dosbox-x -control-stdio -headless -noconfig -noautoexec
 ```
 
@@ -175,6 +201,13 @@ Example socket run with a transcript:
 
 ```bash
 scripts/host_control_client.py --timeout 10 --transcript run.jsonl socket /tmp/dosboxx.sock workflow examples/host-control/interactive-dir.json
+```
+
+Example pipe run with a transcript:
+
+```bash
+./src/dosbox-x -control-pipe /tmp/dosboxx-control -headless -noconfig -noautoexec
+scripts/host_control_client.py --timeout 10 --transcript run.jsonl pipe /tmp/dosboxx-control workflow examples/host-control/interactive-dir.json
 ```
 
 Recipe files are JSON only and use a top-level `steps` array:
@@ -215,9 +248,9 @@ and `input_result`. Object matchers are shallow exact field matches. Workflow
 mode does not decode output, run regular expressions, or support variables,
 conditionals, loops, or parallel steps.
 
-Socket workflows may use every step type. Stdio workflows reject `input_text`
-`key`, and `exec_interactive` steps before spawning DOSBox-X because
-host-control input injection is socket-only.
+Socket and pipe workflows may use every step type. Stdio workflows reject
+`input_text`, `key`, and `exec_interactive` steps before spawning DOSBox-X
+because host-control input injection requires a bidirectional attach transport.
 
 Use `exec_interactive` for commands or programs that need input while their
 output is being captured:
@@ -292,9 +325,8 @@ REPL commands:
 
 Current host control is intentionally small:
 
-- one control client per socket session
+- one control client per socket or pipe session
 - no reconnect loop
 - no server-side command cancellation
-- input injection is socket-only and limited to printable ASCII text plus a small
-  named-key set
-- no pipe transport implementation
+- input injection is limited to printable ASCII text plus a small named-key set
+- pipe transport is Unix FIFO-only; Windows named pipes are not implemented yet
