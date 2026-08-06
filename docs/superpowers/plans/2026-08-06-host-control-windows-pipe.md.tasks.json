@@ -1,0 +1,40 @@
+{
+  "planPath": "docs/superpowers/plans/2026-08-06-host-control-windows-pipe.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: Extract duplex pipe session",
+      "status": "pending",
+      "description": "**Goal:** Move the request queue and output-ordering loop behind platform-neutral line-I/O callbacks while preserving POSIX FIFO behavior.\n\n**Files:**\n- Modify: include/host_control.h:12-170\n- Modify: src/misc/host_control.cpp:210-430,727-896\n- Test: tests/host_control_protocol_tests.cpp:1130-1260\n\n**Acceptance Criteria:**\n- run_control_pipe_session retains its POSIX signature and behavior.\n- The shared runner emits ready, output, status, input-result, and exec-result events in order.\n- Reader shutdown joins without leaking POSIX descriptors.\n\n**Verify:** ./src/dosbox-x -tests --gtest_filter='*HostControl*' -> PASS.\n\n**Steps:**\n1. Add the in-memory failing shared-runner test described in the plan.\n2. Add PeerDisconnectedFn, StopReaderFn, and run_control_duplex_session.\n3. Adapt the POSIX FIFO state to callbacks and run the focused suite.\n4. Commit refactor: share host control duplex pipe session.\n\n```json:metadata\n{\"files\":[\"include/host_control.h\",\"src/misc/host_control.cpp\",\"tests/host_control_protocol_tests.cpp\"],\"verifyCommand\":\"./src/dosbox-x -tests --gtest_filter='*HostControl*'\",\"acceptanceCriteria\":[\"POSIX FIFO behavior is preserved\",\"shared runner emits ordered NDJSON events\"],\"modelTier\":\"standard\"}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Implement Win32 named-pipe server",
+      "status": "pending",
+      "blockedBy": [
+        1
+      ],
+      "description": "**Goal:** Serve one Windows named-pipe client through the shared session runner with clear lifecycle diagnostics.\n\n**Files:**\n- Modify: include/host_control.h:67-170\n- Modify: src/misc/host_control.cpp:1-20,899-1020\n- Test: tests/host_control_protocol_tests.cpp:1130-1260\n\n**Acceptance Criteria:**\n- Short names normalize to \\\\.\\pipe\\<name>; full local paths remain unchanged.\n- One byte-mode PIPE_ACCESS_DUPLEX server is created and serves one client.\n- Failures include endpoint and Win32 error text.\n\n**Verify:** src\\dosbox-x.exe -tests --gtest_filter=*HostControl* -> PASS on Windows.\n\n**Steps:**\n1. Add short/full endpoint and guarded native lifecycle tests.\n2. Add opaque PipeServer handle ownership and CreateNamedPipeW/ConnectNamedPipe lifecycle.\n3. Adapt ReadFile/WriteFile as shared-runner callbacks and test disconnect cleanup.\n4. Commit feat: add Windows host control named pipe server.\n\n```json:metadata\n{\"files\":[\"include/host_control.h\",\"src/misc/host_control.cpp\",\"tests/host_control_protocol_tests.cpp\"],\"verifyCommand\":\"src\\\\dosbox-x.exe -tests --gtest_filter=*HostControl*\",\"acceptanceCriteria\":[\"one byte-mode duplex named pipe is created\",\"short and full endpoints normalize correctly\"],\"modelTier\":\"standard\"}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Add Windows Python pipe client",
+      "status": "pending",
+      "blockedBy": [
+        2
+      ],
+      "description": "**Goal:** Make pipe <endpoint> connect to Windows named pipes using only Python stdlib.\n\n**Files:**\n- Modify: scripts/host_control_client.py:1-320,672-750\n- Test: tests/host_control_client_tests.py:1-220,578-710\n\n**Acceptance Criteria:**\n- Windows selects a ctypes named-pipe transport; non-Windows keeps FIFO behavior.\n- Busy endpoints retry only to timeout and missing endpoints name the normalized path.\n- Existing actions and JSONL transcripts retain their behavior.\n\n**Verify:** python -m unittest tests.host_control_client_tests -v -> PASS.\n\n**Steps:**\n1. Add fake Windows API tests for short/full names, busy retry, missing endpoint, read/write.\n2. Implement WindowsPipeApi with CreateFileW, ReadFile, WriteFile, and CloseHandle.\n3. Pass timeout from make_transport and keep the POSIX path unchanged.\n4. Commit feat: add Windows host control pipe client.\n\n```json:metadata\n{\"files\":[\"scripts/host_control_client.py\",\"tests/host_control_client_tests.py\"],\"verifyCommand\":\"python -m unittest tests.host_control_client_tests -v\",\"acceptanceCriteria\":[\"Windows busy pipe retry obeys timeout\",\"POSIX FIFO behavior remains covered\"],\"modelTier\":\"standard\"}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Document and live-test Windows pipe",
+      "status": "pending",
+      "blockedBy": [
+        3
+      ],
+      "description": "**Goal:** Validate a real Windows status recipe and document platform-specific pipe usage.\n\n**Files:**\n- Modify: tests/host_control_live_tests.py:640-710\n- Modify: docs/host-control.md:180-320\n\n**Acceptance Criteria:**\n- Opt-in Windows smoke runs the status recipe and observes ready/status transcript events.\n- Docs distinguish Unix FIFO pairs from one duplex Windows pipe.\n- Docs contain short and full Windows endpoint commands and the one-client limitation.\n\n**Verify:** set DOSBOX_X_LIVE_TESTS=1 && set DOSBOX_X_BINARY=%CD%\\src\\dosbox-x.exe && python -m unittest tests.host_control_live_tests.HostControlLiveTest.test_pipe_status_recipe_runs -v -> PASS on Windows.\n\n**Steps:**\n1. Replace the current Windows skip with a Windows pipe recipe helper.\n2. Reuse existing server cleanup, transcript, and diagnostics safeguards.\n3. Document MinGW/MSVC Windows examples and Unix FIFO behavior.\n4. Run focused C++/Python/live validation and commit docs: document Windows host control pipes.\n\n```json:metadata\n{\"files\":[\"tests/host_control_live_tests.py\",\"docs/host-control.md\"],\"verifyCommand\":\"python -m unittest tests.host_control_client_tests tests.host_control_live_tests -v\",\"acceptanceCriteria\":[\"opt-in Windows status recipe succeeds over a named pipe\",\"docs contain short and full pipe examples\"],\"modelTier\":\"standard\"}\n```"
+    }
+  ],
+  "lastUpdated": "2026-08-06T00:00:00-07:00"
+}
+
