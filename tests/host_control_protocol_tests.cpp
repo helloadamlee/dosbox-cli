@@ -5,9 +5,11 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <cstdio>
 #include <future>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -811,6 +813,72 @@ TEST(HostControlProtocolTest, SessionRunnerEmitsStatusWithoutResult)
 	          "{\"event\":\"ready\",\"transport\":\"socket\",\"endpoint\":\"/tmp/d.sock\"}\n");
 	EXPECT_EQ(writes[1],
 	          "{\"event\":\"status\",\"id\":\"7\",\"transport\":\"socket\",\"session_active\":true,\"errorlevel\":0,\"drive\":\"Z\",\"cwd\":\"Z:\\\\\"}\n");
+}
+
+TEST(HostControlProtocolTest, DuplexSessionPreservesStatusAndExecResultOrder)
+{
+	const ScopedHostControlDosState dos_state = {};
+	ASSERT_NE(Drives[25], nullptr);
+	DOS_SetDefaultDrive(25);
+	std::strcpy(Drives[25]->curdir, "");
+	dos.return_code = 0;
+
+	std::vector<std::string> writes = {};
+	const std::vector<std::string> requests = {
+	        R"({"id":"status","op":"status"})",
+	        R"({"id":"exec","op":"exec","command":"exit"})",
+	};
+	std::size_t next_request = 0;
+	std::mutex mutex = {};
+	std::condition_variable condition = {};
+	bool stop_reader = false;
+
+	const auto read_line = [&](std::string &line) {
+		std::unique_lock<std::mutex> lock(mutex);
+		if (next_request < requests.size()) {
+			line = requests[next_request++];
+			return true;
+		}
+
+		condition.wait(lock, [&]() { return stop_reader; });
+		line.clear();
+		return false;
+	};
+	const auto write_line = [&](const std::string &line) {
+		std::lock_guard<std::mutex> lock(mutex);
+		writes.push_back(line);
+		return true;
+	};
+	const auto stop = [&]() {
+		std::lock_guard<std::mutex> lock(mutex);
+		stop_reader = true;
+		condition.notify_all();
+	};
+
+	const auto session = host_control::run_control_duplex_session(
+	        {host_control::Transport::Pipe, "memory"},
+	        read_line,
+	        write_line,
+	        []() { return false; },
+	        stop,
+	        [](const host_control::Request &request, host_control::CommandResult &result) {
+			EXPECT_EQ(request.id, "exec");
+			result.shell_exit = true;
+			result.errorlevel = 0;
+			result.drive = "Z";
+			result.cwd = "Z:\\";
+			return true;
+		});
+
+	EXPECT_TRUE(session.started);
+	EXPECT_FALSE(session.had_io_error);
+	ASSERT_EQ(writes.size(), 3u);
+	EXPECT_EQ(writes[0],
+	          "{\"event\":\"ready\",\"transport\":\"pipe\",\"endpoint\":\"memory\"}\n");
+	EXPECT_EQ(writes[1],
+	          "{\"event\":\"status\",\"id\":\"status\",\"transport\":\"pipe\",\"session_active\":true,\"errorlevel\":0,\"drive\":\"Z\",\"cwd\":\"Z:\\\\\"}\n");
+	EXPECT_NE(writes[2].find("\"event\":\"result\""), std::string::npos);
+	EXPECT_NE(writes[2].find("\"id\":\"exec\""), std::string::npos);
 }
 
 TEST(HostControlProtocolTest, SessionRunnerStatusReflectsUpdatedStateBetweenCommands)

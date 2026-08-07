@@ -112,6 +112,101 @@ void reset_session_state()
 	session_active = false;
 }
 
+struct DuplexSessionState {
+	std::mutex mutex = {};
+	std::condition_variable condition = {};
+	std::deque<Request> requests = {};
+	bool disconnected = false;
+	bool had_io_error = false;
+	WriteLineFn write_line = {};
+};
+
+bool write_duplex_session_line(DuplexSessionState &state, const std::string &line)
+{
+	if (line.empty()) {
+		return true;
+	}
+
+	std::lock_guard<std::mutex> lock(state.mutex);
+	if (!state.write_line(line)) {
+		state.had_io_error = true;
+		state.disconnected = true;
+		session_write_failed.store(true);
+		state.condition.notify_all();
+		return false;
+	}
+
+	return true;
+}
+
+void handle_duplex_input_request(DuplexSessionState &state, const Request &request)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+	const bool built = request.op == "input_text"
+	                         ? build_input_codes_for_text(request.text, codes, error)
+	                         : build_input_codes_for_key(request.key, codes, error);
+	if (!built) {
+		(void)write_duplex_session_line(state, make_error_json_line(request.id, error));
+		return;
+	}
+
+	const auto queued = queue_input_codes(codes);
+	if (!queued.ok) {
+		(void)write_duplex_session_line(state, make_error_json_line(request.id, queued.error));
+		return;
+	}
+
+	(void)write_duplex_session_line(
+	        state, make_input_result_json_line(request.id, true, queued.queued));
+}
+
+void duplex_session_reader(DuplexSessionState &state, const ReadLineFn &read_line)
+{
+	for (;;) {
+		std::string line = {};
+		if (!read_line(line)) {
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.disconnected = true;
+			state.condition.notify_all();
+			return;
+		}
+		if (line.empty()) {
+			continue;
+		}
+
+		const auto request = parse_request_line(line);
+		if (!request.ok) {
+			(void)write_duplex_session_line(
+			        state, make_error_json_line(request.id, request.error));
+			continue;
+		}
+
+		if (request.op == "input_text" || request.op == "key") {
+			handle_duplex_input_request(state, request);
+			continue;
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.requests.push_back(request);
+		}
+		state.condition.notify_all();
+	}
+}
+
+bool is_duplex_session_disconnected(DuplexSessionState &state,
+	                                 const PeerDisconnectedFn &peer_disconnected)
+{
+	{
+		std::lock_guard<std::mutex> lock(state.mutex);
+		if (state.disconnected) {
+			return true;
+		}
+	}
+	return peer_disconnected && peer_disconnected();
+}
+
 #if defined(__unix__) || defined(__APPLE__)
 std::string make_errno_message(const char *action, const std::string &path = {})
 {
@@ -310,11 +405,8 @@ struct PipeSessionState {
 	int read_fd = -1;
 	int write_fd = -1;
 	std::mutex mutex = {};
-	std::condition_variable condition = {};
-	std::deque<Request> requests = {};
 	bool disconnected = false;
 	bool stop_reader = false;
-	bool had_io_error = false;
 };
 
 bool write_pipe_session_line(PipeSessionState &state, const std::string &line)
@@ -323,16 +415,7 @@ bool write_pipe_session_line(PipeSessionState &state, const std::string &line)
 		return true;
 	}
 
-	std::lock_guard<std::mutex> lock(state.mutex);
-	if (!write_fd_line(state.write_fd, line)) {
-		state.had_io_error = true;
-		state.disconnected = true;
-		session_write_failed.store(true);
-		state.condition.notify_all();
-		return false;
-	}
-
-	return true;
+	return write_fd_line(state.write_fd, line);
 }
 
 bool should_stop_pipe_reader(PipeSessionState &state)
@@ -389,62 +472,6 @@ bool read_pipe_line(PipeSessionState &state, std::string &line)
 	}
 }
 
-void handle_pipe_input_request(PipeSessionState &state, const Request &request)
-{
-	std::vector<uint16_t> codes = {};
-	std::string error = {};
-	const bool built = request.op == "input_text"
-	                         ? build_input_codes_for_text(request.text, codes, error)
-	                         : build_input_codes_for_key(request.key, codes, error);
-	if (!built) {
-		(void)write_pipe_session_line(state, make_error_json_line(request.id, error));
-		return;
-	}
-
-	const auto queued = queue_input_codes(codes);
-	if (!queued.ok) {
-		(void)write_pipe_session_line(state, make_error_json_line(request.id, queued.error));
-		return;
-	}
-
-	(void)write_pipe_session_line(
-	        state, make_input_result_json_line(request.id, true, queued.queued));
-}
-
-void pipe_session_reader(PipeSessionState &state)
-{
-	for (;;) {
-		std::string line = {};
-		if (!read_pipe_line(state, line)) {
-			std::lock_guard<std::mutex> lock(state.mutex);
-			state.disconnected = true;
-			state.condition.notify_all();
-			return;
-		}
-		if (line.empty()) {
-			continue;
-		}
-
-		const auto request = parse_request_line(line);
-		if (!request.ok) {
-			(void)write_pipe_session_line(
-			        state, make_error_json_line(request.id, request.error));
-			continue;
-		}
-
-		if (request.op == "input_text" || request.op == "key") {
-			handle_pipe_input_request(state, request);
-			continue;
-		}
-
-		{
-			std::lock_guard<std::mutex> lock(state.mutex);
-			state.requests.push_back(request);
-		}
-		state.condition.notify_all();
-	}
-}
-
 bool is_pipe_session_disconnected(PipeSessionState &state)
 {
 	std::lock_guard<std::mutex> lock(state.mutex);
@@ -456,7 +483,6 @@ void stop_pipe_session_reader(PipeSessionState &state)
 	std::lock_guard<std::mutex> lock(state.mutex);
 	state.stop_reader = true;
 	state.disconnected = true;
-	state.condition.notify_all();
 }
 #else
 bool read_stdin_line(std::string &line)
@@ -605,6 +631,120 @@ SessionResult run_control_session(const Options &options,
 	return result;
 }
 
+SessionResult run_control_duplex_session(const Options &options,
+                                         const ReadLineFn &read_line,
+                                         const WriteLineFn &write_line,
+                                         const PeerDisconnectedFn &peer_disconnected,
+                                         const StopReaderFn &stop_reader,
+                                         const ExecRequestFn &exec_request)
+{
+	SessionResult result = {};
+	DuplexSessionState state = {};
+	state.write_line = write_line;
+
+	active_write_line = [&state](const std::string &line) {
+		return write_duplex_session_line(state, line);
+	};
+	active_request_id.clear();
+	reset_buffered_output(buffered_output, {});
+	session_write_failed.store(false);
+	session_active = true;
+
+	if (!emit_session_line(make_ready_json_line(options))) {
+		result.had_io_error = true;
+		reset_session_state();
+		return result;
+	}
+
+	result.started = true;
+	std::thread reader(duplex_session_reader, std::ref(state), std::cref(read_line));
+
+	for (;;) {
+		Request request = {};
+		{
+			std::unique_lock<std::mutex> lock(state.mutex);
+			state.condition.wait(lock, [&state]() {
+				return !state.requests.empty() || state.disconnected;
+			});
+			if (state.disconnected && state.requests.empty()) {
+				break;
+			}
+			if (!state.requests.empty()) {
+				request = state.requests.front();
+				state.requests.pop_front();
+			}
+		}
+
+		if (is_duplex_session_disconnected(state, peer_disconnected)) {
+			break;
+		}
+
+		if (request.op == "status") {
+			if (!emit_session_line(make_status_json_line(request.id, snapshot_status(options)))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
+		if (request.op != "exec") {
+			if (!emit_session_line(make_error_json_line(request.id, "unsupported op"))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
+		CommandResult command_result = {};
+		active_request_id = request.id;
+		reset_buffered_output(buffered_output, request.id);
+		const auto start_ms = get_monotonic_ms();
+		const bool ok = exec_request(request, command_result);
+		const auto end_ms = get_monotonic_ms();
+		command_result.duration_ms = end_ms >= start_ms ? (end_ms - start_ms) : 0;
+		if (is_duplex_session_disconnected(state, peer_disconnected)) {
+			active_request_id.clear();
+			break;
+		}
+		if (session_write_failed.load() ||
+		    !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
+			result.had_io_error = true;
+			active_request_id.clear();
+			break;
+		}
+		active_request_id.clear();
+
+		if (!emit_session_line(make_exec_result_json_line(request.id, ok, command_result))) {
+			result.had_io_error = true;
+			break;
+		}
+		if (command_result.shell_exit) {
+			break;
+		}
+	}
+
+	if (!result.had_io_error &&
+	    !is_duplex_session_disconnected(state, peer_disconnected) &&
+	    !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
+		result.had_io_error = true;
+	}
+
+	if (stop_reader) {
+		stop_reader();
+	}
+	if (reader.joinable()) {
+		reader.join();
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(state.mutex);
+		result.had_io_error = result.had_io_error || state.had_io_error;
+	}
+
+	reset_session_state();
+	return result;
+}
+
 SessionResult run_control_socket_session(const Options &options,
                                          int client_fd,
                                          const ExecRequestFn &exec_request)
@@ -743,107 +883,25 @@ SessionResult run_control_pipe_session(const Options &options,
 	state.read_fd = read_fd;
 	state.write_fd = write_fd;
 
-	active_write_line = [&state](const std::string &line) {
-		return write_pipe_session_line(state, line);
-	};
-	active_request_id.clear();
-	reset_buffered_output(buffered_output, {});
-	session_write_failed.store(false);
-	session_active = true;
-
-	if (!emit_session_line(make_ready_json_line(options))) {
-		result.had_io_error = true;
-		close_fd(state.read_fd);
-		close_fd(state.write_fd);
-		reset_session_state();
-		return result;
-	}
-
-	result.started = true;
-	std::thread reader(pipe_session_reader, std::ref(state));
-
-	for (;;) {
-		Request request = {};
-		{
-			std::unique_lock<std::mutex> lock(state.mutex);
-			state.condition.wait(lock, [&state]() {
-				return !state.requests.empty() || state.disconnected;
-			});
-			if (state.disconnected && state.requests.empty()) {
-				break;
+	result = run_control_duplex_session(
+	        options,
+	        [&state](std::string &line) {
+			const bool read = read_pipe_line(state, line);
+			if (!read) {
+				std::lock_guard<std::mutex> lock(state.mutex);
+				state.disconnected = true;
 			}
-			if (!state.requests.empty()) {
-				request = state.requests.front();
-				state.requests.pop_front();
-			}
-		}
-
-		if (is_pipe_session_disconnected(state)) {
-			break;
-		}
-
-		if (request.op == "status") {
-			if (!emit_session_line(make_status_json_line(request.id, snapshot_status(options)))) {
-				result.had_io_error = true;
-				break;
-			}
-			continue;
-		}
-
-		if (request.op != "exec") {
-			if (!emit_session_line(make_error_json_line(request.id, "unsupported op"))) {
-				result.had_io_error = true;
-				break;
-			}
-			continue;
-		}
-
-		CommandResult command_result = {};
-		active_request_id = request.id;
-		reset_buffered_output(buffered_output, request.id);
-		const auto start_ms = get_monotonic_ms();
-		const bool ok = exec_request(request, command_result);
-		const auto end_ms = get_monotonic_ms();
-		command_result.duration_ms = end_ms >= start_ms ? (end_ms - start_ms) : 0;
-		if (is_pipe_session_disconnected(state)) {
-			active_request_id.clear();
-			break;
-		}
-		if (session_write_failed.load() ||
-		    !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
-			result.had_io_error = true;
-			active_request_id.clear();
-			break;
-		}
-		active_request_id.clear();
-
-		if (!emit_session_line(make_exec_result_json_line(request.id, ok, command_result))) {
-			result.had_io_error = true;
-			break;
-		}
-		if (command_result.shell_exit) {
-			break;
-		}
-	}
-
-	if (!result.had_io_error && !is_pipe_session_disconnected(state) &&
-	    !emit_session_line(flush_buffered_output_json_line(buffered_output))) {
-		result.had_io_error = true;
-	}
-
-	stop_pipe_session_reader(state);
-	if (reader.joinable()) {
-		reader.join();
-	}
-
-	{
-		std::lock_guard<std::mutex> lock(state.mutex);
-		result.had_io_error = result.had_io_error || state.had_io_error;
-	}
+			return read;
+		},
+	        [&state](const std::string &line) {
+			return write_pipe_session_line(state, line);
+		},
+	        [&state]() { return is_pipe_session_disconnected(state); },
+	        [&state]() { stop_pipe_session_reader(state); },
+	        exec_request);
 
 	close_fd(state.read_fd);
 	close_fd(state.write_fd);
-	reset_session_state();
 	return result;
 #endif
 }

@@ -81,6 +81,8 @@ struct PipeServer {
 
 using ReadLineFn = std::function<bool(std::string &)>;
 using WriteLineFn = std::function<bool(const std::string &)>;
+using PeerDisconnectedFn = std::function<bool()>;
+using StopReaderFn = std::function<void()>;
 using ExecRequestFn = std::function<bool(const Request &, CommandResult &)>;
 
 inline const char *transport_to_string(const Transport transport)
@@ -154,6 +156,12 @@ SessionResult run_control_session(const Options &options,
                                   const ReadLineFn &read_line,
                                   const WriteLineFn &write_line,
                                   const ExecRequestFn &exec_request);
+SessionResult run_control_duplex_session(const Options &options,
+                                         const ReadLineFn &read_line,
+                                         const WriteLineFn &write_line,
+                                         const PeerDisconnectedFn &peer_disconnected,
+                                         const StopReaderFn &stop_reader,
+                                         const ExecRequestFn &exec_request);
 SessionResult run_control_socket_session(const Options &options,
                                          int client_fd,
                                          const ExecRequestFn &exec_request);
