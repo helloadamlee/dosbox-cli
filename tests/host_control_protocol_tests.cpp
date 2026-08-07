@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -16,6 +17,7 @@
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #endif
 
@@ -111,14 +113,24 @@ public:
 		}
 	}
 
+	void close_input_writer()
+	{
+		close_fd(input_fds[1]);
+	}
+
 private:
+	static void close_fd(int &fd)
+	{
+		if (fd >= 0) {
+			(void)close(fd);
+			fd = -1;
+		}
+	}
+
 	static void close_pair(int (&fds)[2])
 	{
 		for (auto &fd : fds) {
-			if (fd >= 0) {
-				(void)close(fd);
-				fd = -1;
-			}
+			close_fd(fd);
 		}
 	}
 
@@ -1312,23 +1324,28 @@ TEST(HostControlProtocolTest, PipeSessionStopsReaderAfterShellExitWithWriterOpen
 {
 	int client_to_server[2] = {-1, -1};
 	int server_to_client[2] = {-1, -1};
-	ASSERT_EQ(pipe(client_to_server), 0);
-	ASSERT_EQ(pipe(server_to_client), 0);
 
-	std::promise<void> unused_allow_exec_finish;
+	std::promise<void> allow_exec_finish;
+	std::promise<void> exec_started;
 	std::promise<void> server_finished;
+	auto allow_exec_finish_future = allow_exec_finish.get_future();
+	auto exec_started_future = exec_started.get_future();
 	auto server_finished_future = server_finished.get_future();
 	host_control::SessionResult session = {};
 	std::thread server;
 	PipeSessionTestCleanup cleanup(
-	        unused_allow_exec_finish, client_to_server, server_to_client, server);
+	        allow_exec_finish, client_to_server, server_to_client, server);
+	ASSERT_EQ(pipe(client_to_server), 0);
+	ASSERT_EQ(pipe(server_to_client), 0);
 
 	server = std::thread([&]() {
 		session = host_control::run_control_pipe_session(
 		        {host_control::Transport::Pipe, "/tmp/test.pipe"},
 		        client_to_server[0],
 		        server_to_client[1],
-		        [](const host_control::Request &, host_control::CommandResult &result) {
+		        [&](const host_control::Request &, host_control::CommandResult &result) {
+			        exec_started.set_value();
+			        allow_exec_finish_future.wait();
 			        result.shell_exit = true;
 			        result.errorlevel = 0;
 			        result.drive = "Z";
@@ -1338,9 +1355,23 @@ TEST(HostControlProtocolTest, PipeSessionStopsReaderAfterShellExitWithWriterOpen
 		server_finished.set_value();
 	});
 
-	auto read_line = [&](std::string &line) {
+	auto read_line_for = [&](std::string &line) {
 		line.clear();
-		for (;;) {
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+		while (std::chrono::steady_clock::now() < deadline) {
+			fd_set read_fds = {};
+			FD_SET(server_to_client[0], &read_fds);
+			timeval timeout = {};
+			timeout.tv_usec = 100000;
+			const auto selected = select(
+		        server_to_client[0] + 1, &read_fds, nullptr, nullptr, &timeout);
+			if (selected == 0 || (selected < 0 && errno == EINTR)) {
+				continue;
+			}
+			if (selected < 0) {
+				return false;
+			}
+
 			char byte = 0;
 			const auto received = read(server_to_client[0], &byte, 1);
 			if (received <= 0) {
@@ -1351,30 +1382,57 @@ TEST(HostControlProtocolTest, PipeSessionStopsReaderAfterShellExitWithWriterOpen
 			}
 			line += byte;
 		}
+		return false;
+	};
+
+	auto wait_for_partial_request_to_drain = [&]() {
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+		while (std::chrono::steady_clock::now() < deadline) {
+			int pending_bytes = 0;
+			if (ioctl(client_to_server[0], FIONREAD, &pending_bytes) == 0 &&
+			    pending_bytes == 0) {
+				return true;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		return false;
 	};
 
 	std::string line = {};
-	ASSERT_TRUE(read_line(line));
+	ASSERT_TRUE(read_line_for(line));
 	EXPECT_NE(line.find(R"("event":"ready")"), std::string::npos);
 
 	const std::string exec_request = R"({"id":"1","op":"exec","command":"exit"})" "\n";
 	ASSERT_EQ(write(client_to_server[1], exec_request.data(), exec_request.size()),
 	          static_cast<ssize_t>(exec_request.size()));
+	ASSERT_EQ(exec_started_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+
+	const std::string partial_request = R"({"id":"2","op":"status")";
+	ASSERT_EQ(write(client_to_server[1], partial_request.data(), partial_request.size()),
+	          static_cast<ssize_t>(partial_request.size()));
+	ASSERT_TRUE(wait_for_partial_request_to_drain());
+
+	// The reader consumed the incomplete request and is waiting for its next byte.
+	cleanup.release_exec();
 
 	const auto completion_status = server_finished_future.wait_for(std::chrono::seconds(2));
 	if (completion_status != std::future_status::ready) {
-		// Let cleanup join a failed session without leaving the test blocked.
-		(void)close(client_to_server[1]);
-		client_to_server[1] = -1;
+		// EOF wakes the reader if shell-exit did not stop it.
+		cleanup.close_input_writer();
 		EXPECT_EQ(server_finished_future.wait_for(std::chrono::seconds(2)),
 		          std::future_status::ready);
 	}
 	EXPECT_EQ(completion_status, std::future_status::ready);
-	EXPECT_GE(client_to_server[1], 0);
+	if (completion_status != std::future_status::ready) {
+		return;
+	}
+	if (server.joinable()) {
+		server.join();
+	}
 	EXPECT_TRUE(session.started);
 	EXPECT_FALSE(session.had_io_error);
 
-	ASSERT_TRUE(read_line(line));
+	ASSERT_TRUE(read_line_for(line));
 	EXPECT_NE(line.find(R"("event":"result")"), std::string::npos);
 	EXPECT_NE(line.find(R"("shell_exit":true)"), std::string::npos);
 }
