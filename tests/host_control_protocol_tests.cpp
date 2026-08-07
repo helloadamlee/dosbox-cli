@@ -1307,6 +1307,77 @@ TEST(HostControlProtocolTest, PipeSessionAcceptsInputWhileExecIsRunning)
 	EXPECT_NE(line.find(R"("event":"result")"), std::string::npos);
 	EXPECT_NE(line.find(R"("id":"1")"), std::string::npos);
 }
+
+TEST(HostControlProtocolTest, PipeSessionStopsReaderAfterShellExitWithWriterOpen)
+{
+	int client_to_server[2] = {-1, -1};
+	int server_to_client[2] = {-1, -1};
+	ASSERT_EQ(pipe(client_to_server), 0);
+	ASSERT_EQ(pipe(server_to_client), 0);
+
+	std::promise<void> unused_allow_exec_finish;
+	std::promise<void> server_finished;
+	auto server_finished_future = server_finished.get_future();
+	host_control::SessionResult session = {};
+	std::thread server;
+	PipeSessionTestCleanup cleanup(
+	        unused_allow_exec_finish, client_to_server, server_to_client, server);
+
+	server = std::thread([&]() {
+		session = host_control::run_control_pipe_session(
+		        {host_control::Transport::Pipe, "/tmp/test.pipe"},
+		        client_to_server[0],
+		        server_to_client[1],
+		        [](const host_control::Request &, host_control::CommandResult &result) {
+			        result.shell_exit = true;
+			        result.errorlevel = 0;
+			        result.drive = "Z";
+			        result.cwd = "Z:\\";
+			        return true;
+		        });
+		server_finished.set_value();
+	});
+
+	auto read_line = [&](std::string &line) {
+		line.clear();
+		for (;;) {
+			char byte = 0;
+			const auto received = read(server_to_client[0], &byte, 1);
+			if (received <= 0) {
+				return false;
+			}
+			if (byte == '\n') {
+				return true;
+			}
+			line += byte;
+		}
+	};
+
+	std::string line = {};
+	ASSERT_TRUE(read_line(line));
+	EXPECT_NE(line.find(R"("event":"ready")"), std::string::npos);
+
+	const std::string exec_request = R"({"id":"1","op":"exec","command":"exit"})" "\n";
+	ASSERT_EQ(write(client_to_server[1], exec_request.data(), exec_request.size()),
+	          static_cast<ssize_t>(exec_request.size()));
+
+	const auto completion_status = server_finished_future.wait_for(std::chrono::seconds(2));
+	if (completion_status != std::future_status::ready) {
+		// Let cleanup join a failed session without leaving the test blocked.
+		(void)close(client_to_server[1]);
+		client_to_server[1] = -1;
+		EXPECT_EQ(server_finished_future.wait_for(std::chrono::seconds(2)),
+		          std::future_status::ready);
+	}
+	EXPECT_EQ(completion_status, std::future_status::ready);
+	EXPECT_GE(client_to_server[1], 0);
+	EXPECT_TRUE(session.started);
+	EXPECT_FALSE(session.had_io_error);
+
+	ASSERT_TRUE(read_line(line));
+	EXPECT_NE(line.find(R"("event":"result")"), std::string::npos);
+	EXPECT_NE(line.find(R"("shell_exit":true)"), std::string::npos);
+}
 #endif
 
 } // namespace
