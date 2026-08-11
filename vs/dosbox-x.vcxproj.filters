@@ -666,6 +666,9 @@
     <ClCompile Include="..\src\misc\ethernet.cpp">
       <Filter>Sources\misc</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\misc\ethernet_ethnet.cpp">
+      <Filter>Sources\misc</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\misc\host_control.cpp">
       <Filter>Sources\misc</Filter>
     </ClCompile>
