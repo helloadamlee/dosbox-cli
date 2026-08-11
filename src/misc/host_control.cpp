@@ -7,11 +7,16 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(_WIN32) || defined(WIN32)
+#include <windows.h>
+#endif
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <fcntl.h>
@@ -515,6 +520,238 @@ bool write_stdout_line(const std::string &line)
 
 } // namespace
 
+std::string normalize_windows_pipe_endpoint(const std::string &endpoint)
+{
+	const std::string local_prefix = "\\\\.\\pipe\\";
+	if (endpoint.empty() || endpoint.compare(0, local_prefix.size(), local_prefix) == 0) {
+		return endpoint;
+	}
+	return local_prefix + endpoint;
+}
+
+#if defined(_WIN32) || defined(WIN32)
+namespace {
+
+HANDLE pipe_server_handle(const PipeServer &server)
+{
+	return reinterpret_cast<HANDLE>(server.native_handle);
+}
+
+bool utf8_to_wide(const std::string &value, std::wstring &wide)
+{
+	const auto length = MultiByteToWideChar(CP_UTF8,
+	                                        MB_ERR_INVALID_CHARS,
+	                                        value.data(),
+	                                        static_cast<int>(value.size()),
+	                                        nullptr,
+	                                        0);
+	if (length <= 0) {
+		return false;
+	}
+
+	wide.resize(static_cast<std::size_t>(length));
+	return MultiByteToWideChar(CP_UTF8,
+	                           MB_ERR_INVALID_CHARS,
+	                           value.data(),
+	                           static_cast<int>(value.size()),
+	                           &wide[0],
+	                           length) == length;
+}
+
+std::string wide_to_utf8(const std::wstring &value)
+{
+	if (value.empty()) {
+		return {};
+	}
+
+	const auto length = WideCharToMultiByte(CP_UTF8,
+	                                        0,
+	                                        value.data(),
+	                                        static_cast<int>(value.size()),
+	                                        nullptr,
+	                                        0,
+	                                        nullptr,
+	                                        nullptr);
+	if (length <= 0) {
+		return "unavailable Win32 error text";
+	}
+
+	std::string utf8(static_cast<std::size_t>(length), '\0');
+	if (WideCharToMultiByte(CP_UTF8,
+	                        0,
+	                        value.data(),
+	                        static_cast<int>(value.size()),
+	                        &utf8[0],
+	                        length,
+	                        nullptr,
+	                        nullptr) != length) {
+		return "unavailable Win32 error text";
+	}
+	return utf8;
+}
+
+std::string make_win32_message(const char *action, const std::string &endpoint, const DWORD code)
+{
+	LPWSTR buffer = nullptr;
+	const auto length = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+	                                  FORMAT_MESSAGE_FROM_SYSTEM |
+	                                  FORMAT_MESSAGE_IGNORE_INSERTS,
+	                                  nullptr,
+	                                  code,
+	                                  0,
+	                                  reinterpret_cast<LPWSTR>(&buffer),
+	                                  0,
+	                                  nullptr);
+	std::string detail = length > 0 && buffer != nullptr
+	                             ? wide_to_utf8(std::wstring(buffer, length))
+	                             : "unavailable Win32 error text";
+	if (buffer != nullptr) {
+		(void)LocalFree(buffer);
+	}
+	const auto last = detail.find_last_not_of(" \t\r\n");
+	if (last != std::string::npos) {
+		detail.erase(last + 1);
+	}
+
+	std::string message = action;
+	message += " ";
+	message += endpoint;
+	message += ": ";
+	message += detail;
+	message += " (Win32 error ";
+	message += std::to_string(code);
+	message += ")";
+	return message;
+}
+
+bool is_windows_pipe_disconnect(const DWORD error)
+{
+	return error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA;
+}
+
+bool connect_pipe_server(PipeServer &server, std::string &error)
+{
+	const auto handle = pipe_server_handle(server);
+	if (ConnectNamedPipe(handle, nullptr) != FALSE) {
+		server.connected = true;
+		return true;
+	}
+
+	const auto connect_error = GetLastError();
+	if (connect_error == ERROR_PIPE_CONNECTED) {
+		server.connected = true;
+		return true;
+	}
+
+	error = make_win32_message("failed to connect host control pipe client",
+	                           server.base_path,
+	                           connect_error);
+	return false;
+}
+
+struct WindowsPipeSessionState {
+	HANDLE handle = INVALID_HANDLE_VALUE;
+	std::string endpoint = {};
+	std::atomic<bool> disconnected = {false};
+	std::atomic<bool> failed = {false};
+	std::mutex error_mutex = {};
+	std::string error = {};
+};
+
+void set_windows_pipe_error(WindowsPipeSessionState &state,
+	                         const char *action,
+	                         const DWORD error)
+{
+	state.failed.store(true);
+	state.disconnected.store(true);
+	{
+		std::lock_guard<std::mutex> lock(state.error_mutex);
+		state.error = make_win32_message(action, state.endpoint, error);
+	}
+}
+
+bool read_windows_pipe_line(WindowsPipeSessionState &state, std::string &line)
+{
+	line.clear();
+	for (;;) {
+		if (state.disconnected.load()) {
+			return false;
+		}
+
+		char byte = 0;
+		DWORD received = 0;
+		if (ReadFile(state.handle, &byte, 1, &received, nullptr) == FALSE) {
+			const auto read_error = GetLastError();
+			if (state.disconnected.load() || is_windows_pipe_disconnect(read_error)) {
+				state.disconnected.store(true);
+				return false;
+			}
+			set_windows_pipe_error(state, "failed to read host control pipe", read_error);
+			return false;
+		}
+		if (received == 0) {
+			state.disconnected.store(true);
+			return false;
+		}
+		if (byte == '\n') {
+			return true;
+		}
+		if (byte != '\r') {
+			line += byte;
+		}
+	}
+}
+
+bool write_windows_pipe_line(WindowsPipeSessionState &state, const std::string &line)
+{
+	const char *data = line.data();
+	std::size_t remaining = line.size();
+	while (remaining > 0) {
+		if (state.disconnected.load()) {
+			return false;
+		}
+
+		DWORD written = 0;
+		const auto max_write = (std::numeric_limits<DWORD>::max)();
+		const auto requested = remaining > static_cast<std::size_t>(max_write)
+		                       ? max_write
+		                       : static_cast<DWORD>(remaining);
+		if (WriteFile(state.handle, data, requested, &written, nullptr) == FALSE) {
+			const auto write_error = GetLastError();
+			if (state.disconnected.load() || is_windows_pipe_disconnect(write_error)) {
+				state.disconnected.store(true);
+				return false;
+			}
+			set_windows_pipe_error(state, "failed to write host control pipe", write_error);
+			return false;
+		}
+		if (written == 0) {
+			set_windows_pipe_error(state, "failed to write host control pipe", ERROR_WRITE_FAULT);
+			return false;
+		}
+		data += written;
+		remaining -= static_cast<std::size_t>(written);
+	}
+	return true;
+}
+
+void stop_windows_pipe_reader(WindowsPipeSessionState &state)
+{
+	state.disconnected.store(true);
+	if (state.handle != INVALID_HANDLE_VALUE) {
+		(void)DisconnectNamedPipe(state.handle);
+	}
+}
+
+std::string windows_pipe_session_error(WindowsPipeSessionState &state)
+{
+	std::lock_guard<std::mutex> lock(state.error_mutex);
+	return state.error;
+}
+
+} // namespace
+#endif
+
 SessionResult run_control_session(const Options &options,
                                   const ReadLineFn &read_line,
                                   const WriteLineFn &write_line,
@@ -960,7 +1197,46 @@ bool run_pipe_shell()
 		return false;
 	}
 
-#if !defined(__unix__) && !defined(__APPLE__)
+#if defined(_WIN32) || defined(WIN32)
+	PipeServer server = {};
+	std::string error = {};
+	if (!open_pipe_server(control->opt_host_control.endpoint, server, error)) {
+		std::fprintf(stderr, "%s\n", error.c_str());
+		std::fflush(stderr);
+		return false;
+	}
+	if (!connect_pipe_server(server, error)) {
+		close_pipe_server(server);
+		std::fprintf(stderr, "%s\n", error.c_str());
+		std::fflush(stderr);
+		return false;
+	}
+
+	WindowsPipeSessionState state = {};
+	state.handle = pipe_server_handle(server);
+	state.endpoint = server.base_path;
+	const auto result = run_control_duplex_session(
+	        control->opt_host_control,
+	        [&state](std::string &line) { return read_windows_pipe_line(state, line); },
+	        [&state](const std::string &line) { return write_windows_pipe_line(state, line); },
+	        [&state]() { return state.disconnected.load(); },
+	        [&state]() { stop_windows_pipe_reader(state); },
+	        [](const Request &request, CommandResult &result) {
+		        const bool ok = SHELL_ExecuteHostCommand(request.command, result.shell_exit);
+		        if (ok) {
+			        populate_command_result(result);
+		        }
+		        return ok;
+	        });
+
+	const auto session_error = windows_pipe_session_error(state);
+	close_pipe_server(server);
+	if (!session_error.empty()) {
+		std::fprintf(stderr, "%s\n", session_error.c_str());
+		std::fflush(stderr);
+	}
+	return result.started && session_error.empty();
+#elif !defined(__unix__) && !defined(__APPLE__)
 	std::fprintf(stderr, "Host control pipe transport is unsupported on this platform\n");
 	std::fflush(stderr);
 	return false;
@@ -1011,7 +1287,37 @@ bool open_pipe_server(const std::string &path, PipeServer &server, std::string &
 	server = {};
 	error.clear();
 
-#if !defined(__unix__) && !defined(__APPLE__)
+#if defined(_WIN32) || defined(WIN32)
+	if (path.empty()) {
+		error = "host control pipe path is empty";
+		return false;
+	}
+
+	server.base_path = normalize_windows_pipe_endpoint(path);
+	std::wstring endpoint = {};
+	if (!utf8_to_wide(server.base_path, endpoint)) {
+		error = "host control pipe endpoint is not valid UTF-8: " + server.base_path;
+		return false;
+	}
+
+	const auto handle = CreateNamedPipeW(endpoint.c_str(),
+	                                     PIPE_ACCESS_DUPLEX,
+	                                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+	                                     1,
+	                                     4096,
+	                                     4096,
+	                                     0,
+	                                     nullptr);
+	if (handle == INVALID_HANDLE_VALUE) {
+		error = make_win32_message("failed to create host control pipe",
+	                           server.base_path,
+	                           GetLastError());
+		return false;
+	}
+
+	server.native_handle = reinterpret_cast<std::uintptr_t>(handle);
+	return true;
+#elif !defined(__unix__) && !defined(__APPLE__)
 	error = "host control pipe transport is unsupported on this platform";
 	return false;
 #else
@@ -1064,7 +1370,15 @@ bool open_pipe_server(const std::string &path, PipeServer &server, std::string &
 
 void close_pipe_server(PipeServer &server)
 {
-#if defined(__unix__) || defined(__APPLE__)
+#if defined(_WIN32) || defined(WIN32)
+	if (server.native_handle != 0) {
+		const auto handle = pipe_server_handle(server);
+		if (server.connected) {
+			(void)DisconnectNamedPipe(handle);
+		}
+		(void)CloseHandle(handle);
+	}
+#elif defined(__unix__) || defined(__APPLE__)
 	close_fd(server.input_fd);
 	if (server.created_input_path && !server.input_path.empty()) {
 		(void)unlink(server.input_path.c_str());

@@ -72,11 +72,13 @@ struct SocketServer {
 
 struct PipeServer {
 	int input_fd = -1;
+	std::uintptr_t native_handle = 0;
 	std::string base_path = {};
 	std::string input_path = {};
 	std::string output_path = {};
 	bool created_input_path = false;
 	bool created_output_path = false;
+	bool connected = false;
 };
 
 using ReadLineFn = std::function<bool(std::string &)>;
@@ -173,6 +175,7 @@ bool run_stdio_shell();
 bool run_pipe_shell();
 bool open_socket_server(const std::string &path, SocketServer &server, std::string &error);
 void close_socket_server(SocketServer &server);
+std::string normalize_windows_pipe_endpoint(const std::string &endpoint);
 bool open_pipe_server(const std::string &path, PipeServer &server, std::string &error);
 void close_pipe_server(PipeServer &server);
 bool run_socket_shell();

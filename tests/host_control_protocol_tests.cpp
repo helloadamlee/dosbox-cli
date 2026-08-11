@@ -1052,6 +1052,36 @@ TEST(HostControlProtocolTest, SessionRunnerEmitsStructuredResultMetadata)
 	EXPECT_EQ(writes[1].find("\"duration_ms\":0"), std::string::npos);
 }
 
+TEST(HostControlPipeEndpoint, NormalizesShortWindowsName)
+{
+	EXPECT_EQ(host_control::normalize_windows_pipe_endpoint("dosbox-control"),
+	          "\\\\.\\pipe\\dosbox-control");
+}
+
+TEST(HostControlPipeEndpoint, PreservesFullWindowsName)
+{
+	EXPECT_EQ(host_control::normalize_windows_pipe_endpoint("\\\\.\\pipe\\dosbox-control"),
+	          "\\\\.\\pipe\\dosbox-control");
+}
+
+TEST(HostControlPipeEndpoint, PreservesEmptyName)
+{
+	EXPECT_TRUE(host_control::normalize_windows_pipe_endpoint("").empty());
+}
+
+#if defined(_WIN32) || defined(WIN32)
+TEST(HostControlPipeServer, CreatesDuplexNamedPipeAndCleansUp)
+{
+	host_control::PipeServer server = {};
+	std::string error = {};
+
+	ASSERT_TRUE(host_control::open_pipe_server("dosbox-test-pipe", server, error)) << error;
+	EXPECT_NE(server.native_handle, 0u);
+	host_control::close_pipe_server(server);
+	EXPECT_EQ(server.native_handle, 0u);
+}
+#endif
+
 #if defined(__unix__) || defined(__APPLE__)
 TEST(HostControlProtocolTest, SocketSessionAcceptsInputWhileExecIsRunning)
 {
