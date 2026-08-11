@@ -1545,6 +1545,8 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\misc\clipboard.cpp" />
     <ClCompile Include="..\src\misc\cross.cpp" />
     <ClCompile Include="..\src\misc\ethernet.cpp" />
+    <ClCompile Include="..\src\misc\host_control.cpp" />
+    <ClCompile Include="..\src\misc\host_control_protocol.cpp" />
     <ClCompile Include="..\src\misc\messages.cpp" />
     <ClCompile Include="..\src\misc\ethernet_pcap.cpp" />
     <ClCompile Include="..\src\misc\ethernet_slirp.cpp" />
