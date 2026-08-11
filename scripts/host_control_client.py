@@ -4,10 +4,12 @@ import argparse
 import ctypes
 import json
 import os
+import queue
 import select
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 
@@ -308,6 +310,18 @@ def windows_pipe_error(endpoint, action, error):
     return OSError(f"failed to {action} pipe transport {endpoint} (Windows): {detail}")
 
 
+def windows_pipe_timeout_error(endpoint, error):
+    try:
+        detail = ctypes.FormatError(error).strip()
+    except (AttributeError, OSError):
+        detail = f"Win32 error {error}"
+    return OSError(f"timed out opening pipe transport {endpoint} (Windows): {detail}")
+
+
+def windows_error_code(exc):
+    return exc.winerror or exc.errno or 0
+
+
 class WindowsPipeApi:
     def __init__(self):
         self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -389,6 +403,8 @@ class PipeTransport(BufferedLineTransport):
             self.endpoint = normalize_windows_pipe_endpoint(path)
             self.api = WindowsPipeApi()
             self.handle = INVALID_HANDLE_VALUE
+            self._windows_read_queue = queue.Queue()
+            self._windows_pending_read = None
             return
 
         self.input_path = f"{path}.in"
@@ -411,6 +427,7 @@ class PipeTransport(BufferedLineTransport):
             handle = self.api.create_file(self.endpoint)
             if handle != INVALID_HANDLE_VALUE:
                 self.handle = handle
+                threading.Thread(target=self._read_windows_pipe, daemon=True).start()
                 return
 
             error = self.api.get_last_error()
@@ -421,20 +438,42 @@ class PipeTransport(BufferedLineTransport):
 
             remaining = remaining_seconds(deadline)
             if remaining is not None and remaining <= 0:
-                raise windows_pipe_error(self.endpoint, "open", error)
+                raise windows_pipe_timeout_error(self.endpoint, error)
             time.sleep(min(0.01, remaining) if remaining is not None else 0.01)
             remaining = remaining_seconds(deadline)
             if remaining is not None and remaining <= 0:
-                raise windows_pipe_error(self.endpoint, "open", error)
+                raise windows_pipe_timeout_error(self.endpoint, error)
+
+    def _read_windows_pipe(self):
+        try:
+            while True:
+                chunk = self.api.read_file(self.handle, 4096)
+                self._windows_read_queue.put(chunk)
+                if not chunk:
+                    return
+        except OSError as exc:
+            self._windows_read_queue.put(
+                windows_pipe_error(self.endpoint, "read", windows_error_code(exc))
+            )
+
+    def wait_for_windows_read(self, timeout):
+        if self._windows_pending_read is not None:
+            return True
+        try:
+            self._windows_pending_read = self._windows_read_queue.get(timeout=timeout)
+        except queue.Empty:
+            return False
+        return True
 
     def read_bytes(self):
         if self.windows_pipe:
-            try:
-                return self.api.read_file(self.handle, 4096)
-            except OSError as exc:
-                raise OSError(
-                    f"failed to read Windows pipe transport {self.endpoint}: {exc}"
-                ) from exc
+            if self._windows_pending_read is None:
+                self._windows_pending_read = self._windows_read_queue.get()
+            chunk = self._windows_pending_read
+            self._windows_pending_read = None
+            if isinstance(chunk, OSError):
+                raise chunk
+            return chunk
         return os.read(self.read_fd, 4096)
 
     def fileno(self):
@@ -447,8 +486,8 @@ class PipeTransport(BufferedLineTransport):
             try:
                 self.api.write_file(self.handle, line.encode("utf-8") + b"\n")
             except OSError as exc:
-                raise OSError(
-                    f"failed to write Windows pipe transport {self.endpoint}: {exc}"
+                raise windows_pipe_error(
+                    self.endpoint, "write", windows_error_code(exc)
                 ) from exc
             return
         os.write(self.write_fd, line.encode("utf-8") + b"\n")
@@ -540,11 +579,13 @@ def remaining_seconds(deadline):
 
 
 def wait_for_readable(transport, deadline, description):
-    if getattr(transport, "windows_pipe", False):
-        return
     remaining = remaining_seconds(deadline)
     if remaining is not None and remaining <= 0:
         raise RequestTimeout(f"timed out waiting for {description}")
+    if getattr(transport, "windows_pipe", False):
+        if not transport.wait_for_windows_read(remaining):
+            raise RequestTimeout(f"timed out waiting for {description}")
+        return
     readable, _, _ = select.select([transport.fileno()], [], [], remaining)
     if not readable:
         raise RequestTimeout(f"timed out waiting for {description}")

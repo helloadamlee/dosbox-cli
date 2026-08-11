@@ -63,6 +63,28 @@ class FakeWindowsPipeApi:
         self.closed_handles.append(handle)
 
 
+class BlockingWindowsPipeApi(FakeWindowsPipeApi):
+    def __init__(self):
+        super().__init__([101])
+        self.release_read = threading.Event()
+
+    def read_file(self, handle, size):
+        self.release_read.wait(0.2)
+        return b""
+
+
+class FailingWindowsPipeApi(FakeWindowsPipeApi):
+    def __init__(self, error):
+        super().__init__([101])
+        self.error = error
+
+    def read_file(self, handle, size):
+        raise OSError(self.error, "ReadFile failed")
+
+    def write_file(self, handle, data):
+        raise OSError(self.error, "WriteFile failed")
+
+
 class HostControlClientTest(unittest.TestCase):
     def _serve_socket_once(self, sock_path, response_lines, requests):
         def serve():
@@ -487,10 +509,48 @@ class HostControlClientTest(unittest.TestCase):
              mock.patch.object(module.time, "monotonic", side_effect=[0.0, 0.049, 0.051]), \
              mock.patch.object(module.time, "sleep"):
             transport = module.PipeTransport("dosbox-control", timeout=0.05)
-            with self.assertRaisesRegex(OSError, "failed to open pipe transport"):
+            with self.assertRaisesRegex(OSError, "timed out opening pipe transport"):
                 transport.connect()
 
         self.assertEqual(api.opened_paths, [r"\\.\pipe\dosbox-control"])
+
+    def test_windows_pipe_silent_response_times_out_by_deadline(self):
+        module = load_client_module()
+        api = BlockingWindowsPipeApi()
+
+        with mock.patch.object(module, "WindowsPipeApi", return_value=api), \
+             mock.patch.object(module.os, "name", "nt"):
+            transport = module.PipeTransport("dosbox-control", timeout=0.01)
+            transport.connect()
+            started = time.monotonic()
+            try:
+                with self.assertRaises(module.RequestTimeout):
+                    module.read_event_line(
+                        transport,
+                        module.make_deadline(0.01),
+                        "ready event",
+                    )
+            finally:
+                api.release_read.set()
+                transport.close()
+
+        self.assertLess(time.monotonic() - started, 0.1)
+
+    def test_windows_pipe_read_and_write_errors_include_endpoint_and_system_text(self):
+        module = load_client_module()
+        endpoint = r"\\.\pipe\dosbox-control"
+        api = FailingWindowsPipeApi(module.ERROR_FILE_NOT_FOUND)
+
+        with mock.patch.object(module, "WindowsPipeApi", return_value=api), \
+             mock.patch.object(module.os, "name", "nt"), \
+             mock.patch.object(module.ctypes, "FormatError", return_value="missing pipe detail"):
+            transport = module.PipeTransport("dosbox-control", timeout=0.05)
+            transport.connect()
+            with self.assertRaisesRegex(OSError, r"\\\\\.\\pipe\\dosbox-control.*missing pipe detail"):
+                transport.read_bytes()
+            with self.assertRaisesRegex(OSError, r"\\\\\.\\pipe\\dosbox-control.*missing pipe detail"):
+                transport.writeline('{"id":"1","op":"status"}')
+            transport.close()
 
     def test_windows_pipe_writes_requests_and_reads_responses(self):
         module = load_client_module()
