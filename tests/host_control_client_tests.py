@@ -1,4 +1,5 @@
 import importlib.util
+import ctypes
 import errno
 import io
 import json
@@ -13,6 +14,7 @@ import textwrap
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -27,6 +29,38 @@ def load_client_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+class FakeWindowsPipeApi:
+    def __init__(self, open_results, reads=None):
+        self.open_results = list(open_results)
+        self.reads = list(reads or [])
+        self.opened_paths = []
+        self.writes = []
+        self.closed_handles = []
+        self.last_error = 0
+
+    def create_file(self, endpoint):
+        self.opened_paths.append(endpoint)
+        result = self.open_results.pop(0)
+        if isinstance(result, int) and result < 0:
+            self.last_error = -result
+            return ctypes.c_void_p(-1).value
+        return result
+
+    def get_last_error(self):
+        return self.last_error
+
+    def read_file(self, handle, size):
+        if not self.reads:
+            return b""
+        return self.reads.pop(0)
+
+    def write_file(self, handle, data):
+        self.writes.append((handle, data))
+
+    def close_handle(self, handle):
+        self.closed_handles.append(handle)
 
 
 class HostControlClientTest(unittest.TestCase):
@@ -398,6 +432,146 @@ class HostControlClientTest(unittest.TestCase):
         args = module.parse_args(["--timeout", "2.5", "socket", "/tmp/d.sock", "status"])
 
         self.assertEqual(args.timeout, 2.5)
+
+    def test_windows_pipe_short_name_normalizes_and_retries_busy(self):
+        module = load_client_module()
+        api = FakeWindowsPipeApi([-module.ERROR_PIPE_BUSY, 101])
+
+        with mock.patch.object(module, "WindowsPipeApi", return_value=api), \
+             mock.patch.object(module.os, "name", "nt"), \
+             mock.patch.object(module.time, "sleep"):
+            transport = module.PipeTransport("dosbox-control", timeout=0.05)
+            transport.connect()
+            transport.close()
+
+        self.assertEqual(api.opened_paths, [r"\\.\pipe\dosbox-control"] * 2)
+        self.assertEqual(api.closed_handles, [101])
+
+    def test_windows_pipe_preserves_full_local_path(self):
+        module = load_client_module()
+        endpoint = r"\\.\pipe\dosbox-control"
+        api = FakeWindowsPipeApi([101])
+
+        with mock.patch.object(module, "WindowsPipeApi", return_value=api), \
+             mock.patch.object(module.os, "name", "nt"):
+            transport = module.PipeTransport(endpoint, timeout=0.05)
+            transport.connect()
+            transport.close()
+
+        self.assertEqual(api.opened_paths, [endpoint])
+
+    def test_windows_pipe_rejects_empty_endpoint(self):
+        module = load_client_module()
+
+        with self.assertRaisesRegex(OSError, "endpoint must not be empty"):
+            module.normalize_windows_pipe_endpoint("")
+
+    def test_windows_pipe_missing_endpoint_reports_normalized_name(self):
+        module = load_client_module()
+        api = FakeWindowsPipeApi([-module.ERROR_FILE_NOT_FOUND])
+
+        with mock.patch.object(module, "WindowsPipeApi", return_value=api), \
+             mock.patch.object(module.os, "name", "nt"):
+            transport = module.PipeTransport("missing", timeout=0.01)
+            with self.assertRaisesRegex(OSError, r"\\\\\.\\pipe\\missing"):
+                transport.connect()
+
+        self.assertEqual(api.opened_paths, [r"\\.\pipe\missing"])
+
+    def test_windows_pipe_busy_retry_stops_at_deadline(self):
+        module = load_client_module()
+        api = FakeWindowsPipeApi([-module.ERROR_PIPE_BUSY, 101])
+
+        with mock.patch.object(module, "WindowsPipeApi", return_value=api), \
+             mock.patch.object(module.os, "name", "nt"), \
+             mock.patch.object(module.time, "monotonic", side_effect=[0.0, 0.049, 0.051]), \
+             mock.patch.object(module.time, "sleep"):
+            transport = module.PipeTransport("dosbox-control", timeout=0.05)
+            with self.assertRaisesRegex(OSError, "failed to open pipe transport"):
+                transport.connect()
+
+        self.assertEqual(api.opened_paths, [r"\\.\pipe\dosbox-control"])
+
+    def test_windows_pipe_writes_requests_and_reads_responses(self):
+        module = load_client_module()
+        api = FakeWindowsPipeApi([101], reads=[b'{"event":"ready"}\n'])
+
+        with mock.patch.object(module, "WindowsPipeApi", return_value=api), \
+             mock.patch.object(module.os, "name", "nt"):
+            transport = module.PipeTransport("dosbox-control", timeout=0.05)
+            transport.connect()
+            transport.writeline('{"id":"1","op":"status"}')
+            self.assertTrue(transport.read_available())
+            self.assertEqual(transport.pop_line(), b'{"event":"ready"}\n')
+            transport.close()
+
+        self.assertEqual(api.writes, [(101, b'{"id":"1","op":"status"}\n')])
+
+    def test_windows_pipe_api_maps_broken_pipe_to_eof(self):
+        module = load_client_module()
+
+        class BrokenPipeKernel32:
+            @staticmethod
+            def ReadFile(handle, buffer, size, bytes_read, overlapped):
+                return 0
+
+        api = module.WindowsPipeApi.__new__(module.WindowsPipeApi)
+        api.kernel32 = BrokenPipeKernel32()
+        api.get_last_error = lambda: module.ERROR_BROKEN_PIPE
+
+        self.assertEqual(api.read_file(101, 4096), b"")
+
+    def test_make_transport_passes_timeout_to_pipe_transport(self):
+        module = load_client_module()
+        args = module.parse_args(["--timeout", "2.5", "pipe", "dosbox-control", "status"])
+        transport = mock.Mock()
+
+        with mock.patch.object(module, "PipeTransport", return_value=transport) as pipe_transport:
+            self.assertIs(module.make_transport(args), transport)
+
+        pipe_transport.assert_called_once_with("dosbox-control", timeout=2.5)
+        transport.connect.assert_called_once_with()
+
+    def test_windows_pipe_workflow_preserves_transcript(self):
+        module = load_client_module()
+        lines = [
+            b'{"event":"ready","transport":"pipe"}\n',
+            b'{"event":"status","id":"1","transport":"pipe"}\n',
+        ]
+        api = FakeWindowsPipeApi([101], reads=lines)
+        transcript = io.StringIO()
+
+        with mock.patch.object(module, "WindowsPipeApi", return_value=api), \
+             mock.patch.object(module.os, "name", "nt"):
+            transport = module.PipeTransport("dosbox-control", timeout=0.05)
+            transport.connect()
+            self.assertEqual(
+                module.run_workflow(
+                    transport,
+                    [module.WorkflowStep("status", True)],
+                    timeout=0.05,
+                    transcript=transcript,
+                ),
+                0,
+            )
+            transport.close()
+
+        self.assertEqual(
+            [json.loads(line) for line in transcript.getvalue().splitlines()],
+            [
+                {
+                    "type": "event",
+                    "raw": '{"event":"ready","transport":"pipe"}\n',
+                    "event": {"event": "ready", "transport": "pipe"},
+                },
+                {
+                    "type": "event",
+                    "raw": '{"event":"status","id":"1","transport":"pipe"}\n',
+                    "event": {"event": "status", "id": "1", "transport": "pipe"},
+                },
+            ],
+        )
+        self.assertEqual(api.writes, [(101, b'{"id":"1","op":"status"}\n')])
 
     def test_parse_workflow_recipe_accepts_supported_steps(self):
         module = load_client_module()

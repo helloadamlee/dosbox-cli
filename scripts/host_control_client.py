@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import ctypes
 import json
 import os
 import select
@@ -281,13 +282,115 @@ class SocketTransport(BufferedLineTransport):
         self.close()
 
 
-class PipeTransport(BufferedLineTransport):
-    def __init__(self, path):
-        super().__init__()
-        if os.name == "nt":
-            raise OSError("pipe transport is unsupported on this platform")
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
+OPEN_EXISTING = 3
+ERROR_FILE_NOT_FOUND = 2
+ERROR_BROKEN_PIPE = 109
+ERROR_PIPE_BUSY = 231
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\"
 
+
+def normalize_windows_pipe_endpoint(endpoint):
+    if not endpoint:
+        raise OSError("Windows pipe endpoint must not be empty")
+    if endpoint.startswith(WINDOWS_PIPE_PREFIX):
+        return endpoint
+    return WINDOWS_PIPE_PREFIX + endpoint
+
+
+def windows_pipe_error(endpoint, action, error):
+    try:
+        detail = ctypes.FormatError(error).strip()
+    except (AttributeError, OSError):
+        detail = f"Win32 error {error}"
+    return OSError(f"failed to {action} pipe transport {endpoint} (Windows): {detail}")
+
+
+class WindowsPipeApi:
+    def __init__(self):
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        self.kernel32.CreateFileW.restype = ctypes.c_void_p
+        self.kernel32.ReadFile.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_void_p,
+        ]
+        self.kernel32.ReadFile.restype = ctypes.c_int
+        self.kernel32.WriteFile.argtypes = self.kernel32.ReadFile.argtypes
+        self.kernel32.WriteFile.restype = ctypes.c_int
+        self.kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        self.kernel32.CloseHandle.restype = ctypes.c_int
+
+    def create_file(self, endpoint):
+        return self.kernel32.CreateFileW(
+            endpoint,
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            None,
+            OPEN_EXISTING,
+            0,
+            None,
+        )
+
+    def get_last_error(self):
+        return ctypes.get_last_error()
+
+    def read_file(self, handle, size):
+        buffer = ctypes.create_string_buffer(size)
+        bytes_read = ctypes.c_uint32()
+        if not self.kernel32.ReadFile(handle, buffer, size, ctypes.byref(bytes_read), None):
+            error = self.get_last_error()
+            if error == ERROR_BROKEN_PIPE:
+                return b""
+            raise OSError(error, "ReadFile failed")
+        return buffer.raw[: bytes_read.value]
+
+    def write_file(self, handle, data):
+        offset = 0
+        buffer = (ctypes.c_char * len(data)).from_buffer_copy(data)
+        while offset < len(data):
+            bytes_written = ctypes.c_uint32()
+            if not self.kernel32.WriteFile(
+                handle,
+                ctypes.byref(buffer, offset),
+                len(data) - offset,
+                ctypes.byref(bytes_written),
+                None,
+            ):
+                raise OSError(self.get_last_error(), "WriteFile failed")
+            if bytes_written.value == 0:
+                raise OSError("WriteFile wrote zero bytes")
+            offset += bytes_written.value
+
+    def close_handle(self, handle):
+        self.kernel32.CloseHandle(handle)
+
+
+class PipeTransport(BufferedLineTransport):
+    def __init__(self, path, timeout=None):
+        super().__init__()
         self.path = path
+        self.timeout = timeout
+        self.windows_pipe = os.name == "nt"
+        if self.windows_pipe:
+            self.endpoint = normalize_windows_pipe_endpoint(path)
+            self.api = WindowsPipeApi()
+            self.handle = INVALID_HANDLE_VALUE
+            return
+
         self.input_path = f"{path}.in"
         self.output_path = f"{path}.out"
         self.read_fd = -1
@@ -299,16 +402,63 @@ class PipeTransport(BufferedLineTransport):
             self.close()
             raise OSError(f"failed to open pipe transport {path}: {exc}") from exc
 
+    def connect(self):
+        if not self.windows_pipe or self.handle != INVALID_HANDLE_VALUE:
+            return
+
+        deadline = make_deadline(self.timeout)
+        while True:
+            handle = self.api.create_file(self.endpoint)
+            if handle != INVALID_HANDLE_VALUE:
+                self.handle = handle
+                return
+
+            error = self.api.get_last_error()
+            if error == ERROR_FILE_NOT_FOUND:
+                raise windows_pipe_error(self.endpoint, "open", error)
+            if error != ERROR_PIPE_BUSY:
+                raise windows_pipe_error(self.endpoint, "open", error)
+
+            remaining = remaining_seconds(deadline)
+            if remaining is not None and remaining <= 0:
+                raise windows_pipe_error(self.endpoint, "open", error)
+            time.sleep(min(0.01, remaining) if remaining is not None else 0.01)
+            remaining = remaining_seconds(deadline)
+            if remaining is not None and remaining <= 0:
+                raise windows_pipe_error(self.endpoint, "open", error)
+
     def read_bytes(self):
+        if self.windows_pipe:
+            try:
+                return self.api.read_file(self.handle, 4096)
+            except OSError as exc:
+                raise OSError(
+                    f"failed to read Windows pipe transport {self.endpoint}: {exc}"
+                ) from exc
         return os.read(self.read_fd, 4096)
 
     def fileno(self):
+        if self.windows_pipe:
+            raise OSError("Windows named pipes do not support select")
         return self.read_fd
 
     def writeline(self, line):
+        if self.windows_pipe:
+            try:
+                self.api.write_file(self.handle, line.encode("utf-8") + b"\n")
+            except OSError as exc:
+                raise OSError(
+                    f"failed to write Windows pipe transport {self.endpoint}: {exc}"
+                ) from exc
+            return
         os.write(self.write_fd, line.encode("utf-8") + b"\n")
 
     def close(self):
+        if self.windows_pipe:
+            if self.handle != INVALID_HANDLE_VALUE:
+                self.api.close_handle(self.handle)
+                self.handle = INVALID_HANDLE_VALUE
+            return
         if self.write_fd >= 0:
             os.close(self.write_fd)
             self.write_fd = -1
@@ -390,6 +540,8 @@ def remaining_seconds(deadline):
 
 
 def wait_for_readable(transport, deadline, description):
+    if getattr(transport, "windows_pipe", False):
+        return
     remaining = remaining_seconds(deadline)
     if remaining is not None and remaining <= 0:
         raise RequestTimeout(f"timed out waiting for {description}")
@@ -745,7 +897,9 @@ def make_transport(args):
     if args.transport == "socket":
         return SocketTransport(args.path)
     if args.transport == "pipe":
-        return PipeTransport(args.path)
+        transport = PipeTransport(args.path, timeout=args.timeout)
+        transport.connect()
+        return transport
     return StdioTransport(args.spawn_command)
 
 
