@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -72,8 +73,8 @@ class HostControlLiveDiagnosticsTest(unittest.TestCase):
 
         diagnostics = result.diagnostics()
 
-        self.assertIn("recipe path: examples/host-control/status.json", diagnostics)
-        self.assertIn("transcript path: /tmp/host-control/run.jsonl", diagnostics)
+        self.assertIn(f"recipe path: {Path('examples/host-control/status.json')}", diagnostics)
+        self.assertIn(f"transcript path: {Path('/tmp/host-control/run.jsonl')}", diagnostics)
         self.assertIn("recent events:", diagnostics)
         self.assertIn('{"event":"ready","transport":"socket"}', diagnostics)
         self.assertIn("client stderr:\nclient failed\n", diagnostics)
@@ -421,9 +422,12 @@ class HostControlLiveTest(unittest.TestCase):
 
     def run_pipe_recipe(self, recipe_path, timeout_seconds=10, server_cwd=None):
         artifact_dir = Path(tempfile.mkdtemp(prefix="dosbox-x-host-control-pipe-"))
-        pipe_base = artifact_dir / "control"
-        input_path = Path(f"{pipe_base}.in")
-        output_path = Path(f"{pipe_base}.out")
+        if os.name == "nt":
+            pipe_base = f"dosbox-x-{uuid.uuid4().hex[:12]}"
+        else:
+            pipe_base = artifact_dir / "control"
+            input_path = Path(f"{pipe_base}.in")
+            output_path = Path(f"{pipe_base}.out")
         transcript_path = artifact_dir / "transcript.jsonl"
         stdout_path = artifact_dir / "server.stdout"
         stderr_path = artifact_dir / "server.stderr"
@@ -446,18 +450,35 @@ class HostControlLiveTest(unittest.TestCase):
                 text=True,
             )
             try:
-                deadline = time.monotonic() + timeout_seconds
-                while time.monotonic() < deadline and not (
-                    input_path.exists() and output_path.exists()
-                ):
-                    if server.poll() is not None:
+                if os.name != "nt":
+                    deadline = time.monotonic() + timeout_seconds
+                    while time.monotonic() < deadline and not (
+                        input_path.exists() and output_path.exists()
+                    ):
+                        if server.poll() is not None:
+                            server_stdout.flush()
+                            server_stderr.flush()
+                            server_stdout_text, server_stderr_text = self.read_server_logs(
+                                stdout_path, stderr_path
+                            )
+                            self.fail(
+                                "server exited before creating pipe FIFOs\n"
+                                + self.recipe_diagnostics(
+                                    recipe_path,
+                                    transcript_path,
+                                    server_stdout=server_stdout_text,
+                                    server_stderr=server_stderr_text,
+                                )
+                            )
+                        time.sleep(0.05)
+                    if not (input_path.exists() and output_path.exists()):
                         server_stdout.flush()
                         server_stderr.flush()
                         server_stdout_text, server_stderr_text = self.read_server_logs(
                             stdout_path, stderr_path
                         )
                         self.fail(
-                            "server exited before creating pipe FIFOs\n"
+                            "pipe FIFOs were not created\n"
                             + self.recipe_diagnostics(
                                 recipe_path,
                                 transcript_path,
@@ -465,43 +486,48 @@ class HostControlLiveTest(unittest.TestCase):
                                 server_stderr=server_stderr_text,
                             )
                         )
-                    time.sleep(0.05)
-                if not (input_path.exists() and output_path.exists()):
-                    server_stdout.flush()
-                    server_stderr.flush()
-                    server_stdout_text, server_stderr_text = self.read_server_logs(
-                        stdout_path, stderr_path
-                    )
-                    self.fail(
-                        "pipe FIFOs were not created\n"
-                        + self.recipe_diagnostics(
-                            recipe_path,
-                            transcript_path,
-                            server_stdout=server_stdout_text,
-                            server_stderr=server_stderr_text,
-                        )
-                    )
-
                 try:
-                    proc = subprocess.run(
-                        [
-                            sys.executable,
-                            str(CLIENT),
-                            "--timeout",
-                            str(timeout_seconds),
-                            "--transcript",
-                            str(transcript_path),
-                            "pipe",
-                            str(pipe_base),
-                            "workflow",
-                            str(recipe_path),
-                        ],
-                        text=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        timeout=timeout_seconds + 5,
-                        check=False,
-                    )
+                    client_command = [
+                        sys.executable,
+                        str(CLIENT),
+                        "--timeout",
+                        str(timeout_seconds),
+                        "--transcript",
+                        str(transcript_path),
+                        "pipe",
+                        str(pipe_base),
+                        "workflow",
+                        str(recipe_path),
+                    ]
+                    if os.name != "nt":
+                        proc = subprocess.run(
+                            client_command,
+                            text=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            timeout=timeout_seconds + 5,
+                            check=False,
+                        )
+                    else:
+                        deadline = time.monotonic() + timeout_seconds
+                        while True:
+                            remaining = max(0.1, deadline - time.monotonic())
+                            client_command[3] = str(remaining)
+                            proc = subprocess.run(
+                                client_command,
+                                text=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                timeout=remaining + 5,
+                                check=False,
+                            )
+                            if (
+                                proc.returncode == 0
+                                or "failed to open pipe transport" not in proc.stderr
+                                or time.monotonic() >= deadline
+                            ):
+                                break
+                            time.sleep(0.05)
                 except subprocess.TimeoutExpired as exc:
                     server_stdout.flush()
                     server_stderr.flush()
@@ -644,17 +670,21 @@ class HostControlLiveTest(unittest.TestCase):
         )
 
     def test_pipe_status_recipe_runs(self):
-        if os.name == "nt":
-            raise unittest.SkipTest("pipe transport is Unix FIFO-only in this milestone")
-
         result = self.run_pipe_recipe(EXAMPLE_RECIPES / "status.json", timeout_seconds=10)
 
         self.assertEqual(result.proc.returncode, 0, result.diagnostics())
         self.assertTrue(result.transcript_path.exists(), result.diagnostics())
-        self.assertTrue(
-            any(event.get("event") == "status" for event in result.events),
-            result.diagnostics(),
-        )
+        if os.name == "nt":
+            self.assertEqual(
+                [event.get("event") for event in result.events[:2]],
+                ["ready", "status"],
+                result.diagnostics(),
+            )
+        else:
+            self.assertTrue(
+                any(event.get("event") == "status" for event in result.events),
+                result.diagnostics(),
+            )
 
     def test_socket_interactive_dir_recipe_streams_output(self):
         result = self.run_socket_recipe(

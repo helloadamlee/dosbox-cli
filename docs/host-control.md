@@ -40,10 +40,28 @@ On Unix-like platforms, DOSBox-X creates two FIFOs from the base path:
 - `/tmp/dosboxx-control.in` receives client requests.
 - `/tmp/dosboxx-control.out` sends server events.
 
-The server removes both FIFO paths when the host-control session ends. Windows
-named pipes such as `\\.\pipe\dosbox-x-control` are not implemented in this
-milestone; `-control-pipe` reports that pipe transport is unsupported on
-non-Unix platforms.
+The server removes both FIFO paths when the host-control session ends.
+
+On Windows, `-control-pipe` instead creates one duplex local named pipe. It
+does not create `<endpoint>.in` and `<endpoint>.out` files. You can pass a
+short pipe name, which DOSBox-X expands to the local `\\.\pipe\` namespace:
+
+```powershell
+dosbox-x.exe -control-pipe dosbox-x-control -headless -noconfig -noautoexec
+scripts/host_control_client.py pipe dosbox-x-control status
+```
+
+You can also pass the complete local endpoint explicitly:
+
+```powershell
+dosbox-x.exe -control-pipe '\\.\pipe\dosbox-x-control' -headless -noconfig -noautoexec
+scripts/host_control_client.py pipe '\\.\pipe\dosbox-x-control' status
+```
+
+Windows host control supports local `\\.\pipe\...` endpoints. Remote or network
+pipe paths are unsupported. Each DOSBox-X process accepts one pipe client for
+its host-control session, so use a unique endpoint when running multiple
+processes.
 
 ## Requests
 
@@ -138,8 +156,8 @@ scripts/host_control_client.py socket /tmp/dosboxx.sock key enter
 scripts/host_control_client.py socket /tmp/dosboxx.sock repl
 ```
 
-For pipe mode, start DOSBox-X separately with `-control-pipe <base-path>`, then
-attach the client to the same base path:
+For Unix pipe mode, start DOSBox-X separately with `-control-pipe <base-path>`,
+then attach the client to the same base path:
 
 ```bash
 scripts/host_control_client.py pipe /tmp/dosboxx-control status
@@ -325,8 +343,10 @@ REPL commands:
 
 Current host control is intentionally small:
 
-- one control client per socket or pipe session
+- one control client per socket or pipe session (and therefore one pipe client
+  per DOSBox-X process)
 - no reconnect loop
 - no server-side command cancellation
 - input injection is limited to printable ASCII text plus a small named-key set
-- pipe transport is Unix FIFO-only; Windows named pipes are not implemented yet
+- pipe transport uses paired Unix-like FIFOs or a local Windows
+  `\\.\pipe\...` endpoint; remote and network pipe paths are unsupported
