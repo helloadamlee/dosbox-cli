@@ -20,6 +20,35 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLIENT = REPO_ROOT / "scripts" / "host_control_client.py"
+HAS_UNIX_DOMAIN_SOCKETS = hasattr(socket, "AF_UNIX")
+UNIX_SOCKET_TESTS = frozenset(
+    {
+        "test_socket_status_one_shot_preserves_raw_lines",
+        "test_socket_exec_waits_for_result_after_output",
+        "test_socket_input_text_sends_request_and_waits_for_input_result",
+        "test_socket_key_sends_request_and_waits_for_input_result",
+        "test_socket_workflow_runs_requests_in_sequence",
+        "test_socket_workflow_interactive_exec_sends_input_before_result",
+        "test_socket_workflow_interactive_exec_preserves_early_parent_result",
+        "test_socket_workflow_wait_for_matches_output_event",
+        "test_socket_workflow_timeout_reports_step_and_recent_events",
+        "test_socket_workflow_interactive_timeout_reports_nested_step_context",
+        "test_socket_workflow_fails_on_matching_error_event",
+        "test_socket_workflow_writes_jsonl_transcript_without_changing_stdout",
+        "test_socket_workflow_interactive_exec_writes_transcript",
+        "test_socket_timeout_exits_nonzero_when_request_never_completes",
+        "test_socket_timeout_preserves_output_before_timeout",
+        "test_repl_socket_timeout_exits_nonzero",
+    }
+)
+STDIO_SELECT_TESTS = frozenset(
+    {
+        "test_stdio_status_spawns_child_and_reads_ready_then_status",
+        "test_stdio_exec_reads_result_buffered_after_output",
+        "test_stdio_timeout_terminates_spawned_child",
+        "test_stdio_workflow_timeout_terminates_spawned_child_promptly",
+    }
+)
 
 
 def load_client_module():
@@ -86,6 +115,12 @@ class FailingWindowsPipeApi(FakeWindowsPipeApi):
 
 
 class HostControlClientTest(unittest.TestCase):
+    def setUp(self):
+        if self._testMethodName in UNIX_SOCKET_TESTS and not HAS_UNIX_DOMAIN_SOCKETS:
+            self.skipTest("requires socket.AF_UNIX, unavailable on this Python build")
+        if self._testMethodName in STDIO_SELECT_TESTS and os.name == "nt":
+            self.skipTest("requires select() support for subprocess stdout pipes on Windows")
+
     def _serve_socket_once(self, sock_path, response_lines, requests):
         def serve():
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
