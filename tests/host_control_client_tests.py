@@ -85,6 +85,11 @@ class FakeWindowsPipeApi:
             return b""
         return self.reads.pop(0)
 
+    def peek_file(self, handle):
+        if not self.reads:
+            return 0
+        return len(self.reads[0])
+
     def write_file(self, handle, data):
         self.writes.append((handle, data))
 
@@ -100,6 +105,23 @@ class BlockingWindowsPipeApi(FakeWindowsPipeApi):
     def read_file(self, handle, size):
         self.release_read.wait(0.2)
         return b""
+
+
+class ReadBlocksWriteWindowsPipeApi(FakeWindowsPipeApi):
+    def __init__(self):
+        super().__init__([101])
+        self.read_started = threading.Event()
+        self.release_read = threading.Event()
+
+    def read_file(self, handle, size):
+        self.read_started.set()
+        self.release_read.wait(0.2)
+        return b""
+
+    def write_file(self, handle, data):
+        if self.read_started.is_set():
+            raise OSError("synchronous read blocks the request write")
+        super().write_file(handle, data)
 
 
 class FailingWindowsPipeApi(FakeWindowsPipeApi):
@@ -570,6 +592,20 @@ class HostControlClientTest(unittest.TestCase):
                 transport.close()
 
         self.assertLess(time.monotonic() - started, 0.1)
+
+    def test_windows_pipe_does_not_start_a_read_before_writing_a_request(self):
+        module = load_client_module()
+        api = ReadBlocksWriteWindowsPipeApi()
+
+        with mock.patch.object(module, "WindowsPipeApi", return_value=api), \
+             mock.patch.object(module.os, "name", "nt"):
+            transport = module.PipeTransport("dosbox-control", timeout=0.05)
+            transport.connect()
+            self.assertFalse(api.read_started.wait(0.02))
+            transport.writeline('{"id":"1","op":"status"}')
+            transport.close()
+
+        self.assertEqual(api.writes, [(101, b'{"id":"1","op":"status"}\n')])
 
     def test_windows_pipe_read_and_write_errors_include_endpoint_and_system_text(self):
         module = load_client_module()

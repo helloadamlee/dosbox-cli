@@ -4,12 +4,10 @@ import argparse
 import ctypes
 import json
 import os
-import queue
 import select
 import socket
 import subprocess
 import sys
-import threading
 import time
 from dataclasses import dataclass
 
@@ -345,6 +343,15 @@ class WindowsPipeApi:
         self.kernel32.ReadFile.restype = ctypes.c_int
         self.kernel32.WriteFile.argtypes = self.kernel32.ReadFile.argtypes
         self.kernel32.WriteFile.restype = ctypes.c_int
+        self.kernel32.PeekNamedPipe.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_void_p,
+        ]
+        self.kernel32.PeekNamedPipe.restype = ctypes.c_int
         self.kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         self.kernel32.CloseHandle.restype = ctypes.c_int
 
@@ -371,6 +378,17 @@ class WindowsPipeApi:
                 return b""
             raise OSError(error, "ReadFile failed")
         return buffer.raw[: bytes_read.value]
+
+    def peek_file(self, handle):
+        available = ctypes.c_uint32()
+        if not self.kernel32.PeekNamedPipe(
+            handle, None, 0, None, ctypes.byref(available), None
+        ):
+            error = self.get_last_error()
+            if error == ERROR_BROKEN_PIPE:
+                return None
+            raise OSError(error, "PeekNamedPipe failed")
+        return available.value
 
     def write_file(self, handle, data):
         offset = 0
@@ -403,8 +421,6 @@ class PipeTransport(BufferedLineTransport):
             self.endpoint = normalize_windows_pipe_endpoint(path)
             self.api = WindowsPipeApi()
             self.handle = INVALID_HANDLE_VALUE
-            self._windows_read_queue = queue.Queue()
-            self._windows_pending_read = None
             return
 
         self.input_path = f"{path}.in"
@@ -427,7 +443,6 @@ class PipeTransport(BufferedLineTransport):
             handle = self.api.create_file(self.endpoint)
             if handle != INVALID_HANDLE_VALUE:
                 self.handle = handle
-                threading.Thread(target=self._read_windows_pipe, daemon=True).start()
                 return
 
             error = self.api.get_last_error()
@@ -444,36 +459,30 @@ class PipeTransport(BufferedLineTransport):
             if remaining is not None and remaining <= 0:
                 raise windows_pipe_timeout_error(self.endpoint, error)
 
-    def _read_windows_pipe(self):
-        try:
-            while True:
-                chunk = self.api.read_file(self.handle, 4096)
-                self._windows_read_queue.put(chunk)
-                if not chunk:
-                    return
-        except OSError as exc:
-            self._windows_read_queue.put(
-                windows_pipe_error(self.endpoint, "read", windows_error_code(exc))
-            )
-
     def wait_for_windows_read(self, timeout):
-        if self._windows_pending_read is not None:
-            return True
-        try:
-            self._windows_pending_read = self._windows_read_queue.get(timeout=timeout)
-        except queue.Empty:
-            return False
-        return True
+        deadline = make_deadline(timeout)
+        while True:
+            try:
+                available = self.api.peek_file(self.handle)
+            except OSError as exc:
+                raise windows_pipe_error(
+                    self.endpoint, "check", windows_error_code(exc)
+                ) from exc
+            if available is None or available > 0:
+                return True
+            remaining = remaining_seconds(deadline)
+            if remaining is not None and remaining <= 0:
+                return False
+            time.sleep(min(0.01, remaining) if remaining is not None else 0.01)
 
     def read_bytes(self):
         if self.windows_pipe:
-            if self._windows_pending_read is None:
-                self._windows_pending_read = self._windows_read_queue.get()
-            chunk = self._windows_pending_read
-            self._windows_pending_read = None
-            if isinstance(chunk, OSError):
-                raise chunk
-            return chunk
+            try:
+                return self.api.read_file(self.handle, 4096)
+            except OSError as exc:
+                raise windows_pipe_error(
+                    self.endpoint, "read", windows_error_code(exc)
+                ) from exc
         return os.read(self.read_fd, 4096)
 
     def fileno(self):

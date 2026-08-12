@@ -629,16 +629,45 @@ bool is_windows_pipe_disconnect(const DWORD error)
 	return error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA;
 }
 
+bool wait_for_windows_pipe_io(HANDLE handle,
+                              OVERLAPPED &overlapped,
+                              DWORD &transferred,
+                              DWORD &error)
+{
+	if (WaitForSingleObject(overlapped.hEvent, INFINITE) != WAIT_OBJECT_0) {
+		error = GetLastError();
+		if (error == ERROR_SUCCESS) {
+			error = ERROR_GEN_FAILURE;
+		}
+		return false;
+	}
+	if (GetOverlappedResult(handle, &overlapped, &transferred, FALSE) != FALSE) {
+		return true;
+	}
+	error = GetLastError();
+	return false;
+}
+
 bool connect_pipe_server(PipeServer &server, std::string &error)
 {
 	const auto handle = pipe_server_handle(server);
-	if (ConnectNamedPipe(handle, nullptr) != FALSE) {
-		server.connected = true;
-		return true;
+	OVERLAPPED overlapped = {};
+	overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	if (overlapped.hEvent == nullptr) {
+		error = make_win32_message("failed to create host control pipe connection event",
+		                           server.base_path,
+		                           GetLastError());
+		return false;
 	}
 
-	const auto connect_error = GetLastError();
-	if (connect_error == ERROR_PIPE_CONNECTED) {
+	DWORD ignored = 0;
+	bool connected = ConnectNamedPipe(handle, &overlapped) != FALSE;
+	DWORD connect_error = connected ? ERROR_SUCCESS : GetLastError();
+	if (!connected && connect_error == ERROR_IO_PENDING) {
+		connected = wait_for_windows_pipe_io(handle, overlapped, ignored, connect_error);
+	}
+	(void)CloseHandle(overlapped.hEvent);
+	if (connected || connect_error == ERROR_PIPE_CONNECTED) {
 		server.connected = true;
 		return true;
 	}
@@ -680,8 +709,21 @@ bool read_windows_pipe_line(WindowsPipeSessionState &state, std::string &line)
 
 		char byte = 0;
 		DWORD received = 0;
-		if (ReadFile(state.handle, &byte, 1, &received, nullptr) == FALSE) {
-			const auto read_error = GetLastError();
+		OVERLAPPED overlapped = {};
+		overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		if (overlapped.hEvent == nullptr) {
+			set_windows_pipe_error(state,
+			                       "failed to create host control pipe read event",
+			                       GetLastError());
+			return false;
+		}
+		bool read = ReadFile(state.handle, &byte, 1, &received, &overlapped) != FALSE;
+		DWORD read_error = read ? ERROR_SUCCESS : GetLastError();
+		if (!read && read_error == ERROR_IO_PENDING) {
+			read = wait_for_windows_pipe_io(state.handle, overlapped, received, read_error);
+		}
+		(void)CloseHandle(overlapped.hEvent);
+		if (!read) {
 			if (state.disconnected.load() || is_windows_pipe_disconnect(read_error)) {
 				state.disconnected.store(true);
 				return false;
@@ -716,8 +758,21 @@ bool write_windows_pipe_line(WindowsPipeSessionState &state, const std::string &
 		const auto requested = remaining > static_cast<std::size_t>(max_write)
 		                       ? max_write
 		                       : static_cast<DWORD>(remaining);
-		if (WriteFile(state.handle, data, requested, &written, nullptr) == FALSE) {
-			const auto write_error = GetLastError();
+		OVERLAPPED overlapped = {};
+		overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		if (overlapped.hEvent == nullptr) {
+			set_windows_pipe_error(state,
+			                       "failed to create host control pipe write event",
+			                       GetLastError());
+			return false;
+		}
+		bool wrote = WriteFile(state.handle, data, requested, &written, &overlapped) != FALSE;
+		DWORD write_error = wrote ? ERROR_SUCCESS : GetLastError();
+		if (!wrote && write_error == ERROR_IO_PENDING) {
+			wrote = wait_for_windows_pipe_io(state.handle, overlapped, written, write_error);
+		}
+		(void)CloseHandle(overlapped.hEvent);
+		if (!wrote) {
 			if (state.disconnected.load() || is_windows_pipe_disconnect(write_error)) {
 				state.disconnected.store(true);
 				return false;
@@ -739,6 +794,7 @@ void stop_windows_pipe_reader(WindowsPipeSessionState &state)
 {
 	state.disconnected.store(true);
 	if (state.handle != INVALID_HANDLE_VALUE) {
+		(void)CancelIoEx(state.handle, nullptr);
 		(void)DisconnectNamedPipe(state.handle);
 	}
 }
@@ -915,7 +971,6 @@ SessionResult run_control_duplex_session(const Options &options,
 		if (is_duplex_session_disconnected(state, peer_disconnected)) {
 			break;
 		}
-
 		if (request.op == "status") {
 			if (!emit_session_line(make_status_json_line(request.id, snapshot_status(options)))) {
 				result.had_io_error = true;
@@ -1301,7 +1356,7 @@ bool open_pipe_server(const std::string &path, PipeServer &server, std::string &
 	}
 
 	const auto handle = CreateNamedPipeW(endpoint.c_str(),
-	                                     PIPE_ACCESS_DUPLEX,
+	                                     PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
 	                                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
 	                                     1,
 	                                     4096,
