@@ -63,6 +63,11 @@ pipe paths are unsupported. Each DOSBox-X process accepts one pipe client for
 its host-control session, so use a unique endpoint when running multiple
 processes.
 
+The server rejects remote clients and creates a protected DACL for the current
+user and LocalSystem. Each process accepts one controller and does not
+reconnect. Inbound NDJSON request lines are limited to 1 MiB. Client timeouts
+close the client endpoint; they do not cancel a DOS program already running.
+
 ## Requests
 
 Every request is one JSON object followed by a newline.
@@ -143,6 +148,21 @@ Malformed or unsupported requests emit `error`:
 
 Events are part of the protocol stream. Consumers should preserve their raw
 line order and avoid assuming that command output is text.
+
+## DOS errorlevels
+
+`result.ok` means DOSBox-X accepted and completed the shell request. The DOS
+program's exit status is reported separately as `result.errorlevel`.
+
+The reference client treats errorlevel `0` as success for one-shot `exec` and
+string-form workflow `exec`. Use `--allow-nonzero` for a one-shot inspection,
+or an object-form workflow step when a nonzero code is expected:
+
+```json
+{"exec":{"command":"EXIT7.COM","expect_errorlevel":[0,7]}}
+```
+
+REPL reports nonzero codes on stderr but remains connected.
 
 ## Client
 
@@ -347,6 +367,8 @@ Current host control is intentionally small:
   per DOSBox-X process)
 - no reconnect loop
 - no server-side command cancellation
+- inbound NDJSON request lines are limited to 1 MiB
 - input injection is limited to printable ASCII text plus a small named-key set
 - pipe transport uses paired Unix-like FIFOs or a local Windows
   `\\.\pipe\...` endpoint; remote and network pipe paths are unsupported
+- Windows pipes are restricted to the current user and LocalSystem

@@ -15,7 +15,7 @@ DOSBox-X referenced this capability but never finished it. This fork implements 
 | stdio | Unix-like | ✅ Working |
 | Unix domain socket | Unix-like | ✅ Working |
 | Named pipe | Unix-like (FIFO) | ✅ Working |
-| Named pipe | Windows | 🚧 In progress — see [`docs/host-control-windows-pipe-roadmap.md`](docs/host-control-windows-pipe-roadmap.md) |
+| Named pipe | Windows | ✅ Working — see [`docs/host-control.md`](docs/host-control.md) |
 
 ## Quick start
 
@@ -47,6 +47,9 @@ Receive events back, e.g.:
 ```
 
 A reference Python client is included at [`scripts/host_control_client.py`](scripts/host_control_client.py).
+
+Windows named-pipe automation, workflow recipes, failure semantics, and
+limitations are documented in [docs/host-control.md](docs/host-control.md).
 
 Full protocol reference: [`docs/host-control.md`](docs/host-control.md).
 
