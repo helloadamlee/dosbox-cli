@@ -62,6 +62,10 @@ jobs:
           chmod +x $top/src/bin/dosbox-x-sdl1 $top/src/bin/dosbox-x-sdl2
           $top/src/bin/dosbox-x-sdl1 -tests
           $top/src/bin/dosbox-x-sdl2 -tests
+      - name: Host-control Python tests
+        run: |
+          top=`pwd`
+          python3 -m unittest -v tests.host_control_client_tests
       - name: Package build
         run: |
           top=`pwd`
