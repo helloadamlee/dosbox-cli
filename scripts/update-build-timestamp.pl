@@ -14,7 +14,9 @@ my @months = qw( Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec );
 my $tmp = sprintf("%s %u, %u %u:%02u:%02u%s",$months[$mon-1],$mday,$year,(($hour + 11) % 12) + 1,$min,$sec,$hour >= 12 ? "pm" : "am");
 
 my $commit = `git rev-parse --short=7 HEAD`;
+die "git rev-parse failed\n" if $? != 0;
 chomp($commit);
+die "empty Git commit hash\n" if $commit eq "";
 
 open(X,">","include/build_timestamp.h") || die;
 print X "/*auto-generated*/\n";

@@ -127,6 +127,57 @@ jobs:
         with:
           files: ${{ env.ZIPNAME }}
 
+  host-control-windows:
+    permissions:
+      actions: write
+      contents: write
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Cancel previous runs
+        uses: styfle/cancel-workflow-action@0.13.1
+        with:
+          access_token: ${{ github.token }}
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - uses: microsoft/setup-msbuild@v3
+      - name: Check host control changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            host-control:
+              - 'src/**'
+              - 'include/**'
+              - 'scripts/host_control_client.py'
+              - 'tests/host_control_*'
+              - 'tests/run_host_control_windows.ps1'
+              - 'examples/host-control/**'
+              - '.github/workflows/vsbuild64.yml'
+      - name: Install Perl
+        if: steps.filter.outputs.host-control == 'true' || startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        run: |
+          if (-not (Get-Command perl -ErrorAction SilentlyContinue)) {
+            choco install strawberryperl -y --no-progress
+          }
+      - name: Build and test Windows host control
+        if: steps.filter.outputs.host-control == 'true' || startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_host_control_windows.ps1
+      - name: Upload host-control diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: host-control-windows-${{ github.sha }}
+          path: |
+            artifact-provenance.json
+            tests.log
+            bin/x64/Release SDL2/dosbox-x.exe
+
   MSBuild_ARM64_CI_build:
     permissions:
       actions: write  # for styfle/cancel-workflow-action to cancel/stop running workflows
