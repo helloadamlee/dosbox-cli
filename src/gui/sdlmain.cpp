@@ -7366,6 +7366,11 @@ void DOSBox_ConsolePauseWait() {
     } while (!(c == 13 || c == 10)); /* wait for Enter key */
 }
 
+static bool is_google_test_option(const std::string &option)
+{
+	return option.compare(0, 6, "gtest_") == 0;
+}
+
 bool usecfgdir = false;
 bool DOSBOX_parse_argv() {
     std::string tmp,optname,localname;
@@ -7746,6 +7751,9 @@ bool DOSBOX_parse_argv() {
         else if (optname == "socket") {
             if (!control->cmdline->NextOptArgv(tmp)) return false;
             socknum = std::stoi(tmp);
+        }
+        else if (control->opt_test && is_google_test_option(optname)) {
+            // GoogleTest receives the original argc/argv in main().
         } else {
             printf("WARNING: Unknown option %s (first parsing stage)\n",optname.c_str());
         }

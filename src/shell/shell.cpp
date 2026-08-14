@@ -2297,9 +2297,6 @@ void SHELL_Run() {
 		testerr = true;
 		printf("Unit tests are only available in debug builds\n\n");
 #endif
-#if defined(WIN32)
-		if (sdl_wait_on_error()) DOSBox_ConsolePauseWait();
-#endif
 		return;
 	}
 	i4dos=false;
