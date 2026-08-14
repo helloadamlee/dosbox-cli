@@ -769,7 +769,7 @@ class HostControlLiveTest(unittest.TestCase):
                     "steps": [
                         {"exec": f'mount c "{root}"'},
                         {"exec": "c:"},
-                        {"exec": "BUILD.BAT"},
+                        {"exec": {"command": "BUILD.BAT", "expect_errorlevel": 7}},
                     ]
                 },
                 timeout_seconds=20,

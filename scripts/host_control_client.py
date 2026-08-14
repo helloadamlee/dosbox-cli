@@ -26,6 +26,12 @@ class WorkflowStep:
     value: object = None
 
 
+@dataclass(frozen=True)
+class ExecSpec:
+    command: str
+    expected_errorlevels: tuple = (0,)
+
+
 WORKFLOW_ACTIONS = {
     "comment",
     "exec",
@@ -45,6 +51,29 @@ def parse_workflow_recipe(recipe):
     if not isinstance(steps, list):
         raise WorkflowError("recipe.steps: expected array")
     return parse_workflow_steps(steps)
+
+
+def parse_expected_errorlevels(value, step_name):
+    values = value if isinstance(value, list) else [value]
+    if not values or any(isinstance(code, bool) or not isinstance(code, int) for code in values):
+        raise WorkflowError(
+            f"{step_name}.expect_errorlevel must be an integer or non-empty integer array"
+        )
+    return tuple(values)
+
+
+def parse_exec_spec(value, step_name, interactive=False):
+    if isinstance(value, str) and not interactive:
+        if not value:
+            raise WorkflowError(f"{step_name}: exec must be a non-empty string")
+        return ExecSpec(value)
+    if not isinstance(value, dict):
+        raise WorkflowError(f"{step_name}: exec must be a string or object")
+    command = value.get("command")
+    if not isinstance(command, str) or not command:
+        raise WorkflowError(f"{step_name}.command must be a non-empty string")
+    expected = parse_expected_errorlevels(value.get("expect_errorlevel", 0), step_name)
+    return ExecSpec(command, expected)
 
 
 def parse_workflow_steps(steps, prefix="step"):
@@ -70,21 +99,14 @@ def parse_workflow_steps(steps, prefix="step"):
             if not isinstance(value, str):
                 raise WorkflowError(f"{step_name}: comment must be a string")
         elif action == "exec":
-            if not isinstance(value, str) or not value:
-                raise WorkflowError(f"{step_name}: exec must be a non-empty string")
+            value = parse_exec_spec(value, step_name)
         elif action == "exec_interactive":
-            if not isinstance(value, dict):
-                raise WorkflowError(f"{step_name}: exec_interactive must be an object")
-            command = value.get("command")
-            if not isinstance(command, str) or not command:
-                raise WorkflowError(
-                    f"{step_name}: exec_interactive.command must be a non-empty string"
-                )
+            spec = parse_exec_spec(value, step_name, interactive=True)
             nested_steps = value.get("steps")
             if not isinstance(nested_steps, list):
                 raise WorkflowError(f"{step_name}: exec_interactive.steps must be an array")
             value = {
-                "command": command,
+                "spec": spec,
                 "steps": parse_workflow_steps(nested_steps, prefix=f"{step_name}"),
             }
         elif action == "status":
@@ -206,6 +228,22 @@ def event_completes_request(event, request_id, op):
     if op in ("input_text", "key"):
         return event.get("event") == "input_result"
     return event.get("event") == "result"
+
+
+def validate_completion(event, request_id, op, expected_errorlevels=None, allow_any_errorlevel=False):
+    if event.get("event") == "error":
+        raise WorkflowError(
+            f"server error for request {request_id}: {event.get('message', '')}"
+        )
+    if op == "exec" and event.get("event") == "result" and not allow_any_errorlevel:
+        expected = (0,) if expected_errorlevels is None else tuple(expected_errorlevels)
+        actual = event.get("errorlevel")
+        if actual not in expected:
+            raise WorkflowError(
+                f"DOS command request {request_id} returned errorlevel {actual}; "
+                f"expected {list(expected)}"
+            )
+    return event
 
 
 def parse_repl_command(text):
@@ -630,7 +668,8 @@ def run_request(
     key=None,
     timeout=None,
     recorder=None,
-    fail_on_error=False,
+    expected_errorlevels=None,
+    allow_any_errorlevel=False,
 ):
     deadline = make_deadline(timeout)
     transport.writeline(encode_request(request_id, op, command, text, key))
@@ -642,16 +681,26 @@ def run_request(
             recorder=recorder,
         )
         if event_completes_request(event, request_id, op):
-            if fail_on_error and event.get("event") == "error":
-                raise WorkflowError(
-                    f"server error for request {request_id}: {event.get('message', '')}"
-                )
-            return 0
+            return validate_completion(
+                event,
+                request_id,
+                op,
+                expected_errorlevels=expected_errorlevels,
+                allow_any_errorlevel=allow_any_errorlevel,
+            )
 
 
-def run_one_shot(transport, op, command=None, text=None, key=None, timeout=None):
+def run_one_shot(
+    transport,
+    op,
+    command=None,
+    text=None,
+    key=None,
+    timeout=None,
+    allow_nonzero=False,
+):
     read_event_line(transport, make_deadline(timeout), "ready event")
-    return run_request(
+    run_request(
         transport,
         1,
         op,
@@ -659,7 +708,10 @@ def run_one_shot(transport, op, command=None, text=None, key=None, timeout=None)
         text=text,
         key=key,
         timeout=timeout,
+        expected_errorlevels=None,
+        allow_any_errorlevel=allow_nonzero,
     )
+    return 0
 
 
 def run_repl(transport, timeout=None, allow_input=True):
@@ -701,7 +753,10 @@ def run_repl(transport, timeout=None, allow_input=True):
         elif op == "key":
             run_request(transport, next_request_id, op, key=command, timeout=timeout)
         else:
-            run_request(transport, next_request_id, op, command=command, timeout=timeout)
+            try:
+                run_request(transport, next_request_id, op, command=command, timeout=timeout)
+            except WorkflowError as exc:
+                print(f"command failed: {exc}", file=sys.stderr)
         next_request_id += 1
 
 
@@ -739,17 +794,17 @@ class WorkflowRuntime:
         self.transport.writeline(encode_request(request_id, op, command, text, key))
         return request_id
 
-    def wait_for_request(self, request_id, fail_on_error=True):
+    def wait_for_request(self, request_id, expected_errorlevels=None):
         request_id = str(request_id)
-        if request_id in self.completed_requests:
-            event = self.completed_requests[request_id]
-            if fail_on_error and event.get("event") == "error":
-                raise WorkflowError(
-                    f"server error for request {request_id}: {event.get('message', '')}"
-                )
-            return event
-
         op = self.request_ops[request_id]
+        if request_id in self.completed_requests:
+            return validate_completion(
+                self.completed_requests[request_id],
+                request_id,
+                op,
+                expected_errorlevels=expected_errorlevels,
+            )
+
         remaining_pending = []
         for event in self.pending_events:
             if event_completes_request(event, request_id, op):
@@ -759,26 +814,27 @@ class WorkflowRuntime:
         self.pending_events = remaining_pending
 
         if request_id in self.completed_requests:
-            event = self.completed_requests[request_id]
-            if fail_on_error and event.get("event") == "error":
-                raise WorkflowError(
-                    f"server error for request {request_id}: {event.get('message', '')}"
-                )
-            return event
+            return validate_completion(
+                self.completed_requests[request_id],
+                request_id,
+                op,
+                expected_errorlevels=expected_errorlevels,
+            )
 
         while True:
             event = self.read_event(f"{op} request {request_id}")
             if event_completes_request(event, request_id, op):
-                if fail_on_error and event.get("event") == "error":
-                    raise WorkflowError(
-                        f"server error for request {request_id}: {event.get('message', '')}"
-                    )
-                return event
+                return validate_completion(
+                    event,
+                    request_id,
+                    op,
+                    expected_errorlevels=expected_errorlevels,
+                )
             self.pending_events.append(event)
 
-    def run_request(self, op, command=None, text=None, key=None):
+    def run_request(self, op, command=None, text=None, key=None, expected_errorlevels=None):
         request_id = self.send_request(op, command=command, text=text, key=key)
-        self.wait_for_request(request_id)
+        self.wait_for_request(request_id, expected_errorlevels=expected_errorlevels)
         return request_id
 
     def wait_for_event(self, matcher):
@@ -809,7 +865,12 @@ class WorkflowRuntime:
             return
         try:
             if step.action == "exec":
-                self.run_request("exec", command=step.value)
+                spec = step.value
+                self.run_request(
+                    "exec",
+                    command=spec.command,
+                    expected_errorlevels=spec.expected_errorlevels,
+                )
             elif step.action == "status":
                 self.run_request("status")
             elif step.action == "input_text":
@@ -844,12 +905,16 @@ class WorkflowRuntime:
     def run_exec_interactive(self, step, step_context):
         if not self.allow_input:
             raise WorkflowError("exec_interactive actions require socket or pipe transport")
-        request_id = self.send_request("exec", command=step.value["command"])
+        spec = step.value["spec"]
+        request_id = self.send_request("exec", command=spec.command)
         self.run_steps(
             step.value["steps"],
             context_prefix=f"{step_context} exec_interactive nested step",
         )
-        self.wait_for_request(request_id)
+        self.wait_for_request(
+            request_id,
+            expected_errorlevels=spec.expected_errorlevels,
+        )
 
     def format_failure(self, step_context, action, exc):
         lines = [f"{step_context} {action} failed: {exc}"]
@@ -884,6 +949,11 @@ def parse_args(argv):
         default=None,
         help="write workflow events to a JSONL transcript",
     )
+    parser.add_argument(
+        "--allow-nonzero",
+        action="store_true",
+        help="allow any DOS errorlevel for a one-shot exec request",
+    )
     subparsers = parser.add_subparsers(dest="transport", required=True)
 
     socket_parser = subparsers.add_parser("socket")
@@ -914,6 +984,9 @@ def parse_args(argv):
 
     if args.timeout is not None and args.timeout <= 0:
         parser.error("timeout must be greater than zero")
+
+    if args.allow_nonzero and args.action != "exec":
+        parser.error("--allow-nonzero can only be used with exec")
 
     if args.transport == "stdio" and args.action in ("input-text", "key"):
         parser.error("input actions require socket or pipe transport")
@@ -1001,7 +1074,13 @@ def main(argv=None):
             return run_one_shot(transport, "input_text", text=args.command, timeout=args.timeout)
         if args.action == "key":
             return run_one_shot(transport, "key", key=args.command, timeout=args.timeout)
-        return run_one_shot(transport, args.action, command=args.command, timeout=args.timeout)
+        return run_one_shot(
+            transport,
+            args.action,
+            command=args.command,
+            timeout=args.timeout,
+            allow_nonzero=args.allow_nonzero,
+        )
     except RequestTimeout as exc:
         print(str(exc), file=sys.stderr)
         transport.abort()

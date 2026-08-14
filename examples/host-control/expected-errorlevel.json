@@ -1,0 +1,10 @@
+{
+  "steps": [
+    {
+      "exec": {
+        "command": "EXIT7.COM",
+        "expect_errorlevel": 7
+      }
+    }
+  ]
+}

@@ -39,6 +39,11 @@ UNIX_SOCKET_TESTS = frozenset(
         "test_socket_timeout_exits_nonzero_when_request_never_completes",
         "test_socket_timeout_preserves_output_before_timeout",
         "test_repl_socket_timeout_exits_nonzero",
+        "test_one_shot_exec_exits_nonzero_for_guest_errorlevel",
+        "test_one_shot_exec_allows_nonzero_with_flag",
+        "test_one_shot_exec_fails_on_protocol_error",
+        "test_workflow_exec_accepts_expected_errorlevel_list",
+        "test_workflow_exec_fails_on_unexpected_errorlevel",
     }
 )
 STDIO_SELECT_TESTS = frozenset(
@@ -734,7 +739,7 @@ class HostControlClientTest(unittest.TestCase):
                 "noop",
             ],
         )
-        self.assertEqual(steps[1].value, "mount c /tmp/project")
+        self.assertEqual(steps[1].value, module.ExecSpec("mount c /tmp/project"))
         self.assertEqual(steps[2].value, {"event": "result", "ok": True})
 
     def test_parse_workflow_recipe_rejects_unknown_or_ambiguous_steps(self):
@@ -767,7 +772,7 @@ class HostControlClientTest(unittest.TestCase):
         steps = module.parse_workflow_recipe(recipe)
 
         self.assertEqual(steps[0].action, "exec_interactive")
-        self.assertEqual(steps[0].value["command"], "pause")
+        self.assertEqual(steps[0].value["spec"].command, "pause")
         nested = steps[0].value["steps"]
         self.assertEqual([step.action for step in nested], ["wait_for", "key", "wait_for"])
         self.assertEqual(nested[1].value, "enter")
@@ -775,9 +780,9 @@ class HostControlClientTest(unittest.TestCase):
     def test_parse_workflow_recipe_rejects_malformed_interactive_exec_steps(self):
         module = load_client_module()
 
-        with self.assertRaisesRegex(module.WorkflowError, "step 0: exec_interactive must be an object"):
+        with self.assertRaisesRegex(module.WorkflowError, "step 0: exec must be a string or object"):
             module.parse_workflow_recipe({"steps": [{"exec_interactive": "pause"}]})
-        with self.assertRaisesRegex(module.WorkflowError, "step 0: exec_interactive.command"):
+        with self.assertRaisesRegex(module.WorkflowError, "step 0.command must be a non-empty string"):
             module.parse_workflow_recipe({"steps": [{"exec_interactive": {"steps": []}}]})
         with self.assertRaisesRegex(module.WorkflowError, "step 0: exec_interactive.steps"):
             module.parse_workflow_recipe(
@@ -1765,6 +1770,177 @@ class HostControlClientTest(unittest.TestCase):
 
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("input actions require socket or pipe transport", proc.stderr)
+
+    def test_one_shot_exec_exits_nonzero_for_guest_errorlevel(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"result","id":"1","ok":true,"shell_exit":false,"errorlevel":7,"drive":"Z","cwd":"","duration_ms":1}\n',
+            ]
+            thread = self._serve_socket_once(sock_path, lines, requests)
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "socket", sock_path, "exec", "exit7"],
+                cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+            )
+            thread.join(timeout=2)
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertIn("errorlevel 7", proc.stderr)
+            self.assertEqual(requests, ['{"id":"1","op":"exec","command":"exit7"}\n'])
+
+    def test_one_shot_exec_allows_nonzero_with_flag(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"result","id":"1","ok":true,"shell_exit":false,"errorlevel":7,"drive":"Z","cwd":"","duration_ms":1}\n',
+            ]
+            thread = self._serve_socket_once(sock_path, lines, requests)
+            proc = subprocess.run(
+                [
+                    sys.executable, str(CLIENT), "--allow-nonzero",
+                    "socket", sock_path, "exec", "exit7",
+                ],
+                cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+            )
+            thread.join(timeout=2)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertEqual(requests, ['{"id":"1","op":"exec","command":"exit7"}\n'])
+
+    def test_one_shot_exec_fails_on_protocol_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"error","id":"1","message":"failed"}\n',
+            ]
+            thread = self._serve_socket_once(sock_path, lines, requests)
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "socket", sock_path, "exec", "bad"],
+                cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+            )
+            thread.join(timeout=2)
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertIn("server error for request 1: failed", proc.stderr)
+            self.assertEqual(requests, ['{"id":"1","op":"exec","command":"bad"}\n'])
+
+    def test_workflow_exec_accepts_expected_errorlevel_list(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            recipe_path = self._write_recipe(
+                tmpdir,
+                {"steps": [{"exec": {"command": "exit7", "expect_errorlevel": [0, 7]}}]},
+            )
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"result","id":"1","ok":true,"shell_exit":false,"errorlevel":7,"drive":"Z","cwd":"","duration_ms":1}\n',
+            ]
+            thread = self._serve_socket_workflow(sock_path, lines, requests, 1)
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "socket", sock_path, "workflow", str(recipe_path)],
+                cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+            )
+            thread.join(timeout=2)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "".join(lines))
+
+    def test_workflow_exec_fails_on_unexpected_errorlevel(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = str(Path(tmpdir) / "control.sock")
+            recipe_path = self._write_recipe(tmpdir, {"steps": [{"exec": "exit7"}]})
+            requests = []
+            lines = [
+                '{"event":"ready","transport":"socket"}\n',
+                '{"event":"result","id":"1","ok":true,"shell_exit":false,"errorlevel":7,"drive":"Z","cwd":"","duration_ms":1}\n',
+            ]
+            thread = self._serve_socket_workflow(sock_path, lines, requests, 1)
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "socket", sock_path, "workflow", str(recipe_path)],
+                cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+            )
+            thread.join(timeout=2)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertEqual(proc.stdout, "".join(lines))
+            self.assertIn("workflow step 0 exec failed", proc.stderr)
+            self.assertIn("errorlevel 7", proc.stderr)
+            self.assertIn("expected [0]", proc.stderr)
+
+    def test_parse_exec_spec_rejects_invalid_expected_errorlevels(self):
+        module = load_client_module()
+        for value in ([], [0, "7"], [True], ["0"]):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                module.WorkflowError, "expect_errorlevel must be"
+            ):
+                module.parse_exec_spec(
+                    {"command": "x", "expect_errorlevel": value}, "step 0"
+                )
+
+    def test_allow_nonzero_rejected_for_non_exec_actions(self):
+        proc = subprocess.run(
+            [sys.executable, str(CLIENT), "--allow-nonzero", "socket", "/tmp/d.sock", "status"],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--allow-nonzero can only be used with exec", proc.stderr)
+
+    def test_repl_exec_failure_continues_to_next_command(self):
+        module = load_client_module()
+
+        class FakeTransport(module.BufferedLineTransport):
+            def __init__(self):
+                super().__init__()
+                self._read_buffer.extend(
+                    b'{"event":"ready","transport":"socket"}\n'
+                    b'{"event":"result","id":"1","ok":true,"shell_exit":false,"errorlevel":7,"drive":"Z","cwd":"","duration_ms":1}\n'
+                    b'{"event":"status","id":"2","transport":"socket","session_active":true,"errorlevel":7,"drive":"Z","cwd":""}\n'
+                )
+                self.requests = []
+
+            def read_bytes(self):
+                return b""
+
+            def fileno(self):
+                return -1
+
+            def writeline(self, line):
+                self.requests.append(line)
+
+        class FakeStdout:
+            def __init__(self):
+                self.buffer = io.BytesIO()
+
+            def flush(self):
+                pass
+
+        transport = FakeTransport()
+        old_stdin = sys.stdin
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        try:
+            sys.stdin = io.StringIO("exec exit7\nstatus\nquit\n")
+            sys.stdout = FakeStdout()
+            sys.stderr = io.StringIO()
+            result = module.run_repl(transport)
+        finally:
+            sys.stdin = old_stdin
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            transport.requests,
+            [
+                '{"id":"1","op":"exec","command":"exit7"}',
+                '{"id":"2","op":"status"}',
+            ],
+        )
 
 
 if __name__ == "__main__":
