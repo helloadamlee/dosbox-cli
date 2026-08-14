@@ -1364,6 +1364,7 @@ bool SHELL_ExecuteHostCommand(const std::string &command, bool &shell_exit)
 
 		if (!try_execute_host_native_command(input_line)) {
 			first_shell->ParseLine(input_line);
+			first_shell->RunInternal();
 		}
 
 		if (shell_keyboard_flush) {

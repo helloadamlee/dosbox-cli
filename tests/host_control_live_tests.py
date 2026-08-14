@@ -592,6 +592,14 @@ class HostControlLiveTest(unittest.TestCase):
         recipe_path.write_text(json.dumps(recipe), encoding="utf-8")
         return self.run_socket_recipe(recipe_path, timeout_seconds=timeout_seconds)
 
+    def run_pipe_workflow(self, recipe, timeout_seconds=10, server_cwd=None):
+        artifact_dir = Path(tempfile.mkdtemp(prefix="dosbox-x-host-control-pipe-workflow-"))
+        recipe_path = artifact_dir / "recipe.json"
+        recipe_path.write_text(json.dumps(recipe), encoding="utf-8")
+        return self.run_pipe_recipe(
+            recipe_path, timeout_seconds=timeout_seconds, server_cwd=server_cwd
+        )
+
     def test_exec_mount_returns_result_event(self):
         with tempfile.TemporaryDirectory() as mount_dir:
             result = self.run_stdio_repl(
@@ -747,6 +755,79 @@ class HostControlLiveTest(unittest.TestCase):
             any(event.get("event") == "result" and event.get("ok") for event in result.events),
             result.diagnostics(),
         )
+
+    def test_pipe_batch_exec_completes_synchronously(self):
+        with tempfile.TemporaryDirectory(prefix="dosbox-x-batch-") as temp:
+            root = Path(temp)
+            (root / "EXIT7.COM").write_bytes(bytes.fromhex("B44CB007CD21"))
+            (root / "BUILD.BAT").write_text(
+                "@echo BATCH-BEFORE\r\n@echo done>DONE.TXT\r\n@EXIT7.COM\r\n",
+                encoding="ascii",
+            )
+            result = self.run_pipe_workflow(
+                {
+                    "steps": [
+                        {"exec": f'mount c "{root}"'},
+                        {"exec": "c:"},
+                        {"exec": "BUILD.BAT"},
+                    ]
+                },
+                timeout_seconds=20,
+            )
+            self.assertTrue((root / "DONE.TXT").exists(), result.diagnostics())
+
+        batch_result_index = next(
+            i for i, event in enumerate(result.events)
+            if event.get("event") == "result" and event.get("errorlevel") == 7
+        )
+        output_indexes = [
+            i for i, event in enumerate(result.events)
+            if event.get("event") == "output" and event.get("id") == "3"
+        ]
+        self.assertTrue(output_indexes, result.diagnostics())
+        self.assertLess(max(output_indexes), batch_result_index, result.diagnostics())
+
+    def test_pipe_nested_batch_exec_completes_synchronously(self):
+        with tempfile.TemporaryDirectory(prefix="dosbox-x-nested-batch-") as temp:
+            root = Path(temp)
+            (root / "INNER.BAT").write_text("@echo inner>INNER.TXT\r\n", encoding="ascii")
+            (root / "OUTER.BAT").write_text(
+                "@call INNER.BAT\r\n@echo outer>OUTER.TXT\r\n", encoding="ascii"
+            )
+            result = self.run_pipe_workflow(
+                {
+                    "steps": [
+                        {"exec": f'mount c "{root}"'},
+                        {"exec": "c:"},
+                        {"exec": "OUTER.BAT"},
+                    ]
+                },
+                timeout_seconds=20,
+            )
+            self.assertTrue((root / "INNER.TXT").exists(), result.diagnostics())
+            self.assertTrue((root / "OUTER.TXT").exists(), result.diagnostics())
+
+    def test_pipe_batch_exit_terminates_shell(self):
+        # The batch is named QUIT.BAT because DOSBox-X treats EXIT.BAT as the
+        # internal EXIT command, which skips the batch body entirely.
+        with tempfile.TemporaryDirectory(prefix="dosbox-x-exit-batch-") as temp:
+            root = Path(temp)
+            (root / "QUIT.BAT").write_text("@echo bye>BYE.TXT\r\n@exit\r\n", encoding="ascii")
+            result = self.run_pipe_workflow(
+                {
+                    "steps": [
+                        {"exec": f'mount c "{root}"'},
+                        {"exec": "c:"},
+                        {"exec": "QUIT.BAT"},
+                    ]
+                },
+                timeout_seconds=20,
+            )
+            # The batch body must drain before the shell exits, and the workflow
+            # must return promptly instead of hanging on the closing pipe. The
+            # shell_exit result is asserted once the client tolerates the server
+            # closing the pipe after the final result (Task 5).
+            self.assertTrue((root / "BYE.TXT").exists(), result.diagnostics())
 
 
 if __name__ == "__main__":
