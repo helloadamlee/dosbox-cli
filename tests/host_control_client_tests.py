@@ -550,6 +550,40 @@ class HostControlClientTest(unittest.TestCase):
         with self.assertRaisesRegex(OSError, "endpoint must not be empty"):
             module.normalize_windows_pipe_endpoint("")
 
+    def test_windows_pipe_rejects_nul_endpoint(self):
+        module = load_client_module()
+
+        with self.assertRaisesRegex(OSError, "contain NUL"):
+            module.normalize_windows_pipe_endpoint("a\x00b")
+
+    def test_windows_pipe_prefix_is_case_insensitive(self):
+        module = load_client_module()
+
+        self.assertEqual(
+            module.normalize_windows_pipe_endpoint(r"\\.\PIPE\Dosbox-Control"),
+            r"\\.\pipe\Dosbox-Control",
+        )
+
+    def test_windows_pipe_rejects_remote_unc_endpoint(self):
+        module = load_client_module()
+
+        with self.assertRaisesRegex(OSError, "short name or local"):
+            module.normalize_windows_pipe_endpoint(r"\\server\pipe\name")
+
+    def test_windows_pipe_rejects_path_like_endpoint(self):
+        module = load_client_module()
+
+        with self.assertRaisesRegex(OSError, "short name or local"):
+            module.normalize_windows_pipe_endpoint(r"C:\dosbox-control")
+        with self.assertRaisesRegex(OSError, "short name or local"):
+            module.normalize_windows_pipe_endpoint("dosbox/control")
+
+    def test_windows_pipe_rejects_overlength_endpoint(self):
+        module = load_client_module()
+
+        with self.assertRaisesRegex(OSError, "exceeds 256"):
+            module.normalize_windows_pipe_endpoint("x" * 257)
+
     def test_windows_pipe_missing_endpoint_reports_normalized_name(self):
         module = load_client_module()
         api = FakeWindowsPipeApi([-module.ERROR_FILE_NOT_FOUND])
@@ -960,12 +994,19 @@ class HostControlClientTest(unittest.TestCase):
             )
 
     def test_pipe_missing_endpoint_reports_useful_diagnostic(self):
+        if os.name == "nt":
+            endpoint = "dosboxx-missing-pipe-endpoint"
+            expected = r"\\.\pipe\dosboxx-missing-pipe-endpoint"
+        else:
+            endpoint = "/tmp/dosboxx-missing-pipe-endpoint"
+            expected = "/tmp/dosboxx-missing-pipe-endpoint"
+
         proc = subprocess.run(
             [
                 sys.executable,
                 str(CLIENT),
                 "pipe",
-                "/tmp/dosboxx-missing-pipe-endpoint",
+                endpoint,
                 "status",
             ],
             cwd=REPO_ROOT,
@@ -976,7 +1017,7 @@ class HostControlClientTest(unittest.TestCase):
 
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("failed to open pipe transport", proc.stderr)
-        self.assertIn("/tmp/dosboxx-missing-pipe-endpoint", proc.stderr)
+        self.assertIn(expected, proc.stderr)
 
     def test_pipe_stale_fifo_without_server_exits_promptly(self):
         if not hasattr(os, "mkfifo"):

@@ -21,6 +21,12 @@
 #include <unistd.h>
 #endif
 
+#if defined(_WIN32) || defined(WIN32)
+#include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
+#endif
+
 #include "../src/dos/drives.h"
 #include "dosbox_test_fixture.h"
 
@@ -1054,22 +1060,153 @@ TEST(HostControlProtocolTest, SessionRunnerEmitsStructuredResultMetadata)
 
 TEST(HostControlPipeEndpoint, NormalizesShortWindowsName)
 {
-	EXPECT_EQ(host_control::normalize_windows_pipe_endpoint("dosbox-control"),
+	std::string error = {};
+	EXPECT_EQ(host_control::normalize_windows_pipe_endpoint("dosbox-control", error),
 	          "\\\\.\\pipe\\dosbox-control");
+	EXPECT_TRUE(error.empty());
 }
 
 TEST(HostControlPipeEndpoint, PreservesFullWindowsName)
 {
-	EXPECT_EQ(host_control::normalize_windows_pipe_endpoint("\\\\.\\pipe\\dosbox-control"),
+	std::string error = {};
+	EXPECT_EQ(host_control::normalize_windows_pipe_endpoint("\\\\.\\pipe\\dosbox-control", error),
 	          "\\\\.\\pipe\\dosbox-control");
+	EXPECT_TRUE(error.empty());
 }
 
-TEST(HostControlPipeEndpoint, PreservesEmptyName)
+TEST(HostControlPipeEndpoint, PrefixMatchingIsCaseInsensitive)
 {
-	EXPECT_TRUE(host_control::normalize_windows_pipe_endpoint("").empty());
+	std::string error = {};
+	EXPECT_EQ(host_control::normalize_windows_pipe_endpoint("\\\\.\\PIPE\\Dosbox-Control", error),
+	          "\\\\.\\pipe\\Dosbox-Control");
+	EXPECT_TRUE(error.empty());
+}
+
+TEST(HostControlPipeEndpoint, NormalizesUnicodeShortName)
+{
+	std::string error = {};
+	EXPECT_EQ(host_control::normalize_windows_pipe_endpoint("\xC3\xBC" "ber-pipe", error),
+	          "\\\\.\\pipe\\\xC3\xBC" "ber-pipe");
+	EXPECT_TRUE(error.empty());
+}
+
+TEST(HostControlPipeEndpoint, RejectsEmptyName)
+{
+	std::string error = {};
+	EXPECT_TRUE(host_control::normalize_windows_pipe_endpoint("", error).empty());
+	EXPECT_FALSE(error.empty());
+}
+
+TEST(HostControlPipeEndpoint, RejectsNulContainingName)
+{
+	std::string error = {};
+	EXPECT_TRUE(host_control::normalize_windows_pipe_endpoint(std::string("a\0b", 3), error).empty());
+	EXPECT_FALSE(error.empty());
+}
+
+TEST(HostControlPipeEndpoint, RejectsRemoteUncPath)
+{
+	std::string error = {};
+	EXPECT_TRUE(host_control::normalize_windows_pipe_endpoint("\\\\server\\pipe\\name", error).empty());
+	EXPECT_FALSE(error.empty());
+}
+
+TEST(HostControlPipeEndpoint, RejectsPathLikeNames)
+{
+	std::string error = {};
+	EXPECT_TRUE(host_control::normalize_windows_pipe_endpoint("C:\\dosbox-control", error).empty());
+	EXPECT_FALSE(error.empty());
+	EXPECT_TRUE(host_control::normalize_windows_pipe_endpoint("dosbox/control", error).empty());
+	EXPECT_FALSE(error.empty());
+}
+
+TEST(HostControlPipeEndpoint, RejectsOverlengthName)
+{
+	std::string error = {};
+	EXPECT_TRUE(host_control::normalize_windows_pipe_endpoint(std::string(257, 'x'), error).empty());
+	EXPECT_FALSE(error.empty());
 }
 
 #if defined(_WIN32) || defined(WIN32)
+namespace {
+
+std::wstring token_user_sid_string()
+{
+	HANDLE token = nullptr;
+	if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) == FALSE) {
+		return {};
+	}
+	DWORD size = 0;
+	(void)GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+	if (size == 0) {
+		(void)CloseHandle(token);
+		return {};
+	}
+	std::vector<unsigned char> buffer(size);
+	const auto *user = reinterpret_cast<PTOKEN_USER>(buffer.data());
+	if (GetTokenInformation(token, TokenUser, buffer.data(), size, &size) == FALSE) {
+		(void)CloseHandle(token);
+		return {};
+	}
+	(void)CloseHandle(token);
+
+	LPWSTR sid_string = nullptr;
+	if (ConvertSidToStringSidW(user->User.Sid, &sid_string) == FALSE) {
+		return {};
+	}
+	std::wstring result(sid_string);
+	(void)LocalFree(sid_string);
+	return result;
+}
+
+bool pipe_dacl_ace_sids(HANDLE pipe, std::vector<std::wstring> &sids, std::vector<DWORD> &masks)
+{
+	PSECURITY_DESCRIPTOR descriptor = nullptr;
+	if (GetSecurityInfo(pipe, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr,
+	                    nullptr, nullptr, &descriptor) != ERROR_SUCCESS) {
+		return false;
+	}
+
+	BOOL present = FALSE;
+	BOOL defaulted = FALSE;
+	PACL dacl = nullptr;
+	if (GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted) == FALSE ||
+	    !present || dacl == nullptr) {
+		(void)LocalFree(descriptor);
+		return false;
+	}
+
+	ACL_SIZE_INFORMATION info = {};
+	if (GetAclInformation(dacl, &info, sizeof(info), AclSizeInformation) == FALSE) {
+		(void)LocalFree(descriptor);
+		return false;
+	}
+
+	for (DWORD i = 0; i < info.AceCount; ++i) {
+		LPVOID ace = nullptr;
+		if (GetAce(dacl, i, &ace) == FALSE) {
+			continue;
+		}
+		const auto *header = static_cast<ACE_HEADER *>(ace);
+		if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) {
+			continue;
+		}
+		const auto *allowed = static_cast<ACCESS_ALLOWED_ACE *>(ace);
+		LPWSTR sid_string = nullptr;
+		if (ConvertSidToStringSidW((PSID)&allowed->SidStart, &sid_string) == FALSE) {
+			continue;
+		}
+		sids.emplace_back(sid_string);
+		masks.push_back(allowed->Mask);
+		(void)LocalFree(sid_string);
+	}
+
+	(void)LocalFree(descriptor);
+	return true;
+}
+
+} // namespace
+
 TEST(HostControlPipeServer, CreatesDuplexNamedPipeAndCleansUp)
 {
 	host_control::PipeServer server = {};
@@ -1079,6 +1216,53 @@ TEST(HostControlPipeServer, CreatesDuplexNamedPipeAndCleansUp)
 	EXPECT_NE(server.native_handle, 0u);
 	host_control::close_pipe_server(server);
 	EXPECT_EQ(server.native_handle, 0u);
+}
+
+TEST(HostControlPipeServer, GrantsAccessOnlyToCurrentUserAndSystem)
+{
+	host_control::PipeServer server = {};
+	std::string error = {};
+
+	ASSERT_TRUE(host_control::open_pipe_server("dosbox-acl-test-pipe", server, error)) << error;
+
+	const auto pipe = reinterpret_cast<HANDLE>(server.native_handle);
+	std::vector<std::wstring> sids = {};
+	std::vector<DWORD> masks = {};
+	ASSERT_TRUE(pipe_dacl_ace_sids(pipe, sids, masks)) << "could not read pipe DACL";
+
+	ASSERT_EQ(sids.size(), 2u);
+	const std::wstring expected_user = token_user_sid_string();
+	ASSERT_FALSE(expected_user.empty());
+
+	bool has_system = false;
+	bool has_user = false;
+	for (std::size_t i = 0; i < sids.size(); ++i) {
+		EXPECT_EQ(masks[i], static_cast<DWORD>(FILE_ALL_ACCESS));
+		if (sids[i] == L"S-1-5-18") {
+			has_system = true;
+		} else if (sids[i] == expected_user) {
+			has_user = true;
+		}
+	}
+	EXPECT_TRUE(has_system);
+	EXPECT_TRUE(has_user);
+
+	host_control::close_pipe_server(server);
+}
+
+TEST(HostControlPipeServer, RejectsSecondInstanceOfSameName)
+{
+	host_control::PipeServer first = {};
+	std::string error = {};
+	ASSERT_TRUE(host_control::open_pipe_server("dosbox-first-instance-pipe", first, error)) << error;
+
+	host_control::PipeServer second = {};
+	std::string second_error = {};
+	EXPECT_FALSE(host_control::open_pipe_server("dosbox-first-instance-pipe", second, second_error));
+	EXPECT_FALSE(second_error.empty());
+
+	host_control::close_pipe_server(first);
+	host_control::close_pipe_server(second);
 }
 #endif
 

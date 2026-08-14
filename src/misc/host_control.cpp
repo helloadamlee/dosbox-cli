@@ -16,6 +16,8 @@
 
 #if defined(_WIN32) || defined(WIN32)
 #include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
 #endif
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -520,21 +522,155 @@ bool write_stdout_line(const std::string &line)
 
 } // namespace
 
-std::string normalize_windows_pipe_endpoint(const std::string &endpoint)
+static bool ascii_case_insensitive_prefix(const std::string &value, const std::string &prefix)
 {
-	const std::string local_prefix = "\\\\.\\pipe\\";
-	if (endpoint.empty() || endpoint.compare(0, local_prefix.size(), local_prefix) == 0) {
-		return endpoint;
+	if (value.size() < prefix.size()) {
+		return false;
 	}
-	return local_prefix + endpoint;
+
+	for (std::size_t i = 0; i < prefix.size(); ++i) {
+		const auto lower = [](const char c) {
+			return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
+		};
+		if (lower(value[i]) != lower(prefix[i])) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+std::string normalize_windows_pipe_endpoint(const std::string &value,
+                                            std::string &error)
+{
+	const std::string prefix = "\\\\.\\pipe\\";
+	error.clear();
+	if (value.empty() || value.find('\0') != std::string::npos) {
+		error = "Windows pipe endpoint must not be empty or contain NUL";
+		return {};
+	}
+
+	std::string normalized = value;
+	if (ascii_case_insensitive_prefix(value, prefix)) {
+		normalized = prefix + value.substr(prefix.size());
+	} else {
+		if (value.compare(0, 2, "\\\\") == 0 ||
+		    value.find('\\') != std::string::npos || value.find('/') != std::string::npos) {
+			error = "Windows pipe endpoint must be a short name or local \\\\.\\pipe\\ path";
+			return {};
+		}
+		normalized = prefix + value;
+	}
+
+	if (normalized.size() == prefix.size() || normalized.size() > 256) {
+		error = "Windows pipe endpoint name is empty or exceeds 256 characters";
+		return {};
+	}
+
+	return normalized;
 }
 
 #if defined(_WIN32) || defined(WIN32)
 namespace {
 
+std::string make_win32_message(const char *action, const std::string &endpoint,
+                               const DWORD code);
+
 HANDLE pipe_server_handle(const PipeServer &server)
 {
 	return reinterpret_cast<HANDLE>(server.native_handle);
+}
+
+class SecurityDescriptorHolder {
+public:
+	~SecurityDescriptorHolder()
+	{
+		reset();
+	}
+
+	SecurityDescriptorHolder() = default;
+
+	SecurityDescriptorHolder(const SecurityDescriptorHolder &) = delete;
+	SecurityDescriptorHolder &operator=(const SecurityDescriptorHolder &) = delete;
+
+	void reset(PSECURITY_DESCRIPTOR descriptor = nullptr)
+	{
+		if (descriptor_ != nullptr) {
+			(void)LocalFree(descriptor_);
+		}
+		descriptor_ = descriptor;
+	}
+
+	PSECURITY_DESCRIPTOR get() const
+	{
+		return descriptor_;
+	}
+
+private:
+	PSECURITY_DESCRIPTOR descriptor_ = nullptr;
+};
+
+bool build_windows_pipe_security_descriptor(const std::string &endpoint,
+                                            std::string &error,
+                                            PSECURITY_DESCRIPTOR &descriptor)
+{
+	descriptor = nullptr;
+
+	HANDLE token = nullptr;
+	if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) == FALSE) {
+		error = make_win32_message("failed to open process token for host control pipe",
+		                           endpoint,
+		                           GetLastError());
+		return false;
+	}
+
+	DWORD size = 0;
+	(void)GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+	if (size == 0) {
+		(void)CloseHandle(token);
+		error = make_win32_message("failed to size process token user for host control pipe",
+		                           endpoint,
+		                           GetLastError());
+		return false;
+	}
+
+	std::vector<uint8_t> buffer(size);
+	auto *const user = reinterpret_cast<PTOKEN_USER>(buffer.data());
+	if (GetTokenInformation(token, TokenUser, user, size, &size) == FALSE) {
+		(void)CloseHandle(token);
+		error = make_win32_message("failed to read process token user for host control pipe",
+		                           endpoint,
+		                           GetLastError());
+		return false;
+	}
+	(void)CloseHandle(token);
+
+	LPWSTR sid_string = nullptr;
+	if (ConvertSidToStringSidW(user->User.Sid, &sid_string) == FALSE) {
+		error = make_win32_message("failed to convert user SID for host control pipe",
+		                           endpoint,
+		                           GetLastError());
+		return false;
+	}
+
+	const std::wstring sddl = L"D:P(A;;GA;;;SY)(A;;GA;;;" + std::wstring(sid_string) + L")";
+	(void)LocalFree(sid_string);
+	sid_string = nullptr;
+
+	PSECURITY_DESCRIPTOR built = nullptr;
+	if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+	            sddl.c_str(),
+	            SDDL_REVISION_1,
+	            &built,
+	            nullptr) == FALSE) {
+		error = make_win32_message("failed to build host control pipe security descriptor",
+	                           endpoint,
+	                           GetLastError());
+		return false;
+	}
+
+	descriptor = built;
+	return true;
 }
 
 bool utf8_to_wide(const std::string &value, std::wstring &wide)
@@ -1348,21 +1484,38 @@ bool open_pipe_server(const std::string &path, PipeServer &server, std::string &
 		return false;
 	}
 
-	server.base_path = normalize_windows_pipe_endpoint(path);
+	server.base_path = normalize_windows_pipe_endpoint(path, error);
+	if (!error.empty()) {
+		return false;
+	}
+
 	std::wstring endpoint = {};
 	if (!utf8_to_wide(server.base_path, endpoint)) {
 		error = "host control pipe endpoint is not valid UTF-8: " + server.base_path;
 		return false;
 	}
 
-	const auto handle = CreateNamedPipeW(endpoint.c_str(),
-	                                     PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-	                                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-	                                     1,
-	                                     4096,
-	                                     4096,
-	                                     0,
-	                                     nullptr);
+	PSECURITY_DESCRIPTOR descriptor = nullptr;
+	if (!build_windows_pipe_security_descriptor(server.base_path, error, descriptor)) {
+		return false;
+	}
+	SecurityDescriptorHolder descriptor_holder;
+	descriptor_holder.reset(descriptor);
+
+	SECURITY_ATTRIBUTES attributes = {};
+	attributes.nLength = sizeof(attributes);
+	attributes.lpSecurityDescriptor = descriptor_holder.get();
+	attributes.bInheritHandle = FALSE;
+
+	const auto handle = CreateNamedPipeW(
+	        endpoint.c_str(),
+	        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+	        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+	        1,
+	        4096,
+	        4096,
+	        0,
+	        &attributes);
 	if (handle == INVALID_HANDLE_VALUE) {
 		error = make_win32_message("failed to create host control pipe",
 	                           server.base_path,

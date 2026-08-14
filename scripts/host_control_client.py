@@ -331,11 +331,20 @@ WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\"
 
 
 def normalize_windows_pipe_endpoint(endpoint):
-    if not endpoint:
-        raise OSError("Windows pipe endpoint must not be empty")
-    if endpoint.startswith(WINDOWS_PIPE_PREFIX):
-        return endpoint
-    return WINDOWS_PIPE_PREFIX + endpoint
+    prefix = WINDOWS_PIPE_PREFIX
+    if not endpoint or "\x00" in endpoint:
+        raise OSError("Windows pipe endpoint must not be empty or contain NUL")
+    if endpoint.casefold().startswith(prefix.casefold()):
+        normalized = prefix + endpoint[len(prefix):]
+    else:
+        if endpoint.startswith("\\\\") or "\\" in endpoint or "/" in endpoint:
+            raise OSError(
+                "Windows pipe endpoint must be a short name or local \\\\.\\pipe\\ path"
+            )
+        normalized = prefix + endpoint
+    if len(normalized) == len(prefix) or len(normalized) > 256:
+        raise OSError("Windows pipe endpoint name is empty or exceeds 256 characters")
+    return normalized
 
 
 def windows_pipe_error(endpoint, action, error):

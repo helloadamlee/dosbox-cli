@@ -175,7 +175,8 @@ bool run_stdio_shell();
 bool run_pipe_shell();
 bool open_socket_server(const std::string &path, SocketServer &server, std::string &error);
 void close_socket_server(SocketServer &server);
-std::string normalize_windows_pipe_endpoint(const std::string &endpoint);
+std::string normalize_windows_pipe_endpoint(const std::string &value,
+                                            std::string &error);
 bool open_pipe_server(const std::string &path, PipeServer &server, std::string &error);
 void close_pipe_server(PipeServer &server);
 bool run_socket_shell();
