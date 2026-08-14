@@ -1,3 +1,5 @@
+import base64
+import importlib.util
 import json
 import os
 import subprocess
@@ -828,6 +830,122 @@ class HostControlLiveTest(unittest.TestCase):
             # shell_exit result is asserted once the client tolerates the server
             # closing the pipe after the final result (Task 5).
             self.assertTrue((root / "BYE.TXT").exists(), result.diagnostics())
+
+    def test_pipe_high_volume_output_is_byte_exact(self):
+        payload = b"0123456789ABCDEF\r\n" * 700_000
+        with tempfile.TemporaryDirectory(prefix="dosbox-x-large-") as temp:
+            root = Path(temp)
+            (root / "LARGE.TXT").write_bytes(payload)
+            result = self.run_pipe_workflow(
+                {
+                    "steps": [
+                        {"exec": f'mount c "{root}"'},
+                        {"exec": "c:"},
+                        {"exec": "type LARGE.TXT"},
+                    ]
+                },
+                timeout_seconds=300,
+            )
+
+        self.assertEqual(result.proc.returncode, 0, result.diagnostics())
+        large_request_id = None
+        for event in result.events:
+            if event.get("event") == "result":
+                large_request_id = event.get("id")
+        self.assertIsNotNone(large_request_id, result.diagnostics())
+
+        decoded = b"".join(
+            base64.b64decode(event["data"])
+            for event in result.events
+            if event.get("event") == "output"
+            and event.get("id") == large_request_id
+            and event.get("data")
+        )
+        self.assertEqual(decoded, payload, result.diagnostics())
+
+    def test_pipe_disconnect_during_exec_terminates_cleanly(self):
+        if os.name != "nt":
+            raise unittest.SkipTest("Windows named-pipe disconnect test")
+
+        spec = importlib.util.spec_from_file_location("host_control_client", CLIENT)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        api = module.WindowsPipeApi()
+        pipe_base = f"dosbox-x-{uuid.uuid4().hex[:12]}"
+        endpoint = module.normalize_windows_pipe_endpoint(pipe_base)
+
+        server = subprocess.Popen(
+            [
+                str(self.dosbox_x),
+                "-control-pipe",
+                pipe_base,
+                "-headless",
+                "-noconfig",
+                "-noautoexec",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        handle = module.INVALID_HANDLE_VALUE
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and handle == module.INVALID_HANDLE_VALUE:
+                handle = api.create_file(endpoint)
+                if handle != module.INVALID_HANDLE_VALUE:
+                    break
+                error = api.get_last_error()
+                if error not in (module.ERROR_PIPE_BUSY, module.ERROR_FILE_NOT_FOUND):
+                    break
+                time.sleep(0.05)
+
+            self.assertNotEqual(
+                handle, module.INVALID_HANDLE_VALUE, "could not open named pipe"
+            )
+
+            api.write_file(handle, b'{"id":"1","op":"exec","command":"dir"}\n')
+
+            saw_output = False
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not saw_output:
+                chunk = api.read_file(handle, 4096)
+                if not chunk:
+                    break
+                for line in chunk.splitlines():
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("event") == "output":
+                        saw_output = True
+                        break
+            self.assertTrue(saw_output, "server produced no output before disconnect")
+
+            api.close_handle(handle)
+            handle = module.INVALID_HANDLE_VALUE
+
+            try:
+                server.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                server.terminate()
+                try:
+                    server.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+                    self.fail("DOSBox-X hung after client disconnect")
+        finally:
+            if handle != module.INVALID_HANDLE_VALUE:
+                api.close_handle(handle)
+            if server.poll() is None:
+                server.kill()
+                server.wait()
+            if server.stdout is not None:
+                server.stdout.close()
+            if server.stderr is not None:
+                server.stderr.close()
 
 
 if __name__ == "__main__":

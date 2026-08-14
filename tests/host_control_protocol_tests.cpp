@@ -1127,6 +1127,59 @@ TEST(HostControlPipeEndpoint, RejectsOverlengthName)
 	EXPECT_FALSE(error.empty());
 }
 
+TEST(HostControlPipeFraming, AccumulatesSplitCrlfLines)
+{
+	host_control::LineAccumulator state = {};
+	EXPECT_TRUE(host_control::append_line_bytes(state, "first", 5));
+	EXPECT_TRUE(state.lines.empty());
+	EXPECT_TRUE(host_control::append_line_bytes(state, "\r\nsecond\r\n", 10));
+	ASSERT_EQ(state.lines.size(), 2u);
+	EXPECT_EQ(state.lines[0], "first");
+	EXPECT_EQ(state.lines[1], "second");
+}
+
+TEST(HostControlPipeFraming, AccumulatesMultipleLinesPerChunk)
+{
+	host_control::LineAccumulator state = {};
+	EXPECT_TRUE(host_control::append_line_bytes(state, "a\nb\nc\n", 6));
+	ASSERT_EQ(state.lines.size(), 3u);
+	EXPECT_EQ(state.lines[0], "a");
+	EXPECT_EQ(state.lines[1], "b");
+	EXPECT_EQ(state.lines[2], "c");
+}
+
+TEST(HostControlPipeFraming, AccumulatesUtf8JsonSplitAcrossChunks)
+{
+	host_control::LineAccumulator state = {};
+	const std::string json = "{\"command\":\"\xC3\xBC\"}\n";
+	const std::size_t split = json.size() / 2;
+	EXPECT_TRUE(host_control::append_line_bytes(state, json.data(), split));
+	EXPECT_TRUE(state.lines.empty());
+	EXPECT_TRUE(host_control::append_line_bytes(state, json.data() + split, json.size() - split));
+	ASSERT_EQ(state.lines.size(), 1u);
+	EXPECT_EQ(state.lines[0], json.substr(0, json.size() - 1));
+}
+
+TEST(HostControlPipeFraming, AcceptsExactlyOneMiBLine)
+{
+	host_control::LineAccumulator state = {};
+	const std::string line(1024u * 1024u, 'x');
+	EXPECT_TRUE(host_control::append_line_bytes(state, line.data(), line.size()));
+	EXPECT_TRUE(state.lines.empty());
+	EXPECT_TRUE(host_control::append_line_bytes(state, "\n", 1));
+	ASSERT_EQ(state.lines.size(), 1u);
+	EXPECT_EQ(state.lines[0].size(), 1024u * 1024u);
+}
+
+TEST(HostControlPipeFraming, RejectsOversizedRequestLine)
+{
+	host_control::LineAccumulator state = {};
+	const std::string oversized(1024u * 1024u + 1u, 'x');
+	EXPECT_FALSE(host_control::append_line_bytes(state, oversized.data(), oversized.size()));
+	EXPECT_TRUE(state.failed);
+	EXPECT_EQ(state.error, "request line exceeds 1048576 bytes");
+}
+
 #if defined(_WIN32) || defined(WIN32)
 namespace {
 
@@ -1209,7 +1262,7 @@ bool pipe_dacl_ace_sids(HANDLE pipe, std::vector<std::wstring> &sids, std::vecto
 
 TEST(HostControlPipeServer, CreatesDuplexNamedPipeAndCleansUp)
 {
-	host_control::PipeServer server = {};
+	host_control::PipeServer server{};
 	std::string error = {};
 
 	ASSERT_TRUE(host_control::open_pipe_server("dosbox-test-pipe", server, error)) << error;
@@ -1220,7 +1273,7 @@ TEST(HostControlPipeServer, CreatesDuplexNamedPipeAndCleansUp)
 
 TEST(HostControlPipeServer, GrantsAccessOnlyToCurrentUserAndSystem)
 {
-	host_control::PipeServer server = {};
+	host_control::PipeServer server{};
 	std::string error = {};
 
 	ASSERT_TRUE(host_control::open_pipe_server("dosbox-acl-test-pipe", server, error)) << error;
@@ -1252,17 +1305,46 @@ TEST(HostControlPipeServer, GrantsAccessOnlyToCurrentUserAndSystem)
 
 TEST(HostControlPipeServer, RejectsSecondInstanceOfSameName)
 {
-	host_control::PipeServer first = {};
+	host_control::PipeServer first{};
 	std::string error = {};
 	ASSERT_TRUE(host_control::open_pipe_server("dosbox-first-instance-pipe", first, error)) << error;
 
-	host_control::PipeServer second = {};
+	host_control::PipeServer second{};
 	std::string second_error = {};
 	EXPECT_FALSE(host_control::open_pipe_server("dosbox-first-instance-pipe", second, second_error));
 	EXPECT_FALSE(second_error.empty());
 
 	host_control::close_pipe_server(first);
 	host_control::close_pipe_server(second);
+}
+
+TEST(HostControlPipeServer, RejectsDuplicateFirstInstance)
+{
+	host_control::PipeServer first{};
+	host_control::PipeServer second{};
+	std::string error = {};
+	const auto name = "dosbox-test-" + std::to_string(GetCurrentProcessId()) + "-duplicate";
+	ASSERT_TRUE(host_control::open_pipe_server(name, first, error)) << error;
+	EXPECT_FALSE(host_control::open_pipe_server(name, second, error));
+	EXPECT_NE(error.find("Win32 error"), std::string::npos) << error;
+	host_control::close_pipe_server(second);
+	host_control::close_pipe_server(first);
+}
+
+TEST(HostControlPipeServer, CancelsPendingConnectOnClose)
+{
+	host_control::PipeServer server{};
+	std::string error = {};
+	const auto name = "dosbox-test-" + std::to_string(GetCurrentProcessId()) + "-cancel";
+	ASSERT_TRUE(host_control::open_pipe_server(name, server, error)) << error;
+	auto connecting = std::async(std::launch::async, [&]() {
+		std::string connect_error = {};
+		return host_control::connect_pipe_server(server, connect_error);
+	});
+	host_control::request_pipe_server_stop(server);
+	EXPECT_EQ(connecting.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+	EXPECT_FALSE(connecting.get());
+	host_control::close_pipe_server(server);
 }
 #endif
 
@@ -1428,7 +1510,7 @@ TEST(HostControlProtocolTest, SocketServerRemovesStalePathAndCleansUpOnClose)
 
 TEST(HostControlProtocolTest, PipeServerRejectsEmptyEndpoint)
 {
-	host_control::PipeServer server = {};
+	host_control::PipeServer server{};
 	std::string error = {};
 
 	EXPECT_FALSE(host_control::open_pipe_server("", server, error));
@@ -1444,7 +1526,7 @@ TEST(HostControlProtocolTest, PipeServerCreatesFifoPairAndCleansUpOnClose)
 	const auto input_path = base_path + ".in";
 	const auto output_path = base_path + ".out";
 
-	host_control::PipeServer server = {};
+	host_control::PipeServer server{};
 	std::string error = {};
 	ASSERT_TRUE(host_control::open_pipe_server(base_path, server, error)) << error;
 	EXPECT_EQ(access(input_path.c_str(), F_OK), 0);

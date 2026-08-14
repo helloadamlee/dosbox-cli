@@ -1,8 +1,10 @@
 #ifndef DOSBOX_HOST_CONTROL_H
 #define DOSBOX_HOST_CONTROL_H
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <string>
 #include <vector>
@@ -73,6 +75,8 @@ struct SocketServer {
 struct PipeServer {
 	int input_fd = -1;
 	std::uintptr_t native_handle = 0;
+	std::uintptr_t connect_event = 0;
+	std::atomic<bool> stop_requested = {false};
 	std::string base_path = {};
 	std::string input_path = {};
 	std::string output_path = {};
@@ -80,6 +84,18 @@ struct PipeServer {
 	bool created_output_path = false;
 	bool connected = false;
 };
+
+struct LineAccumulator {
+	std::string buffered = {};
+	std::deque<std::string> lines = {};
+	bool failed = false;
+	std::string error = {};
+};
+
+bool append_line_bytes(LineAccumulator &state,
+                       const char *data,
+                       std::size_t size,
+                       std::size_t max_line_bytes = 1024u * 1024u);
 
 using ReadLineFn = std::function<bool(std::string &)>;
 using WriteLineFn = std::function<bool(const std::string &)>;
@@ -178,6 +194,8 @@ void close_socket_server(SocketServer &server);
 std::string normalize_windows_pipe_endpoint(const std::string &value,
                                             std::string &error);
 bool open_pipe_server(const std::string &path, PipeServer &server, std::string &error);
+bool connect_pipe_server(PipeServer &server, std::string &error);
+void request_pipe_server_stop(PipeServer &server);
 void close_pipe_server(PipeServer &server);
 bool run_socket_shell();
 bool build_input_codes_for_text(const std::string &text,
