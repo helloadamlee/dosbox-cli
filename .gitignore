@@ -144,3 +144,11 @@ contrib/macos/dosbox-x.plist
 
 # local linked worktrees used for feature isolation
 /.worktrees/
+
+# Host-control release-gate and test artifacts
+/artifact-provenance.json
+/tests.log
+/tests_*.log
+/tests_*.xml
+/build*.log
+__pycache__/
