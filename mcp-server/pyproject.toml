@@ -1,0 +1,21 @@
+[project]
+name = "dosbox-x-mcp"
+version = "0.1.0"
+description = "MCP server wrapping DOSBox-X host-control for agentic DOS automation"
+requires-python = ">=3.9"
+dependencies = [
+    "mcp>=1.2.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+dosbox-mcp = "dosbox_mcp.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["dosbox_mcp*"]
