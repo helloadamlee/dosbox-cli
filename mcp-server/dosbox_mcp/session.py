@@ -121,12 +121,26 @@ class DosboxSession:
         )
 
         transport = PipeTransport(endpoint, timeout=_READY_TIMEOUT)
-        try:
-            transport.connect()
-        except OSError as exc:
-            process.kill()
-            process.wait()
-            raise SessionError(f"failed to connect to dosbox-x: {exc}") from exc
+        connect_deadline = time.monotonic() + _READY_TIMEOUT
+        while True:
+            try:
+                transport.connect()
+                break
+            except OSError as exc:
+                # On Windows the server creates its named pipe a moment after
+                # the process starts; CreateFile reports ERROR_FILE_NOT_FOUND
+                # until it does. Retry until the pipe appears, the process
+                # dies, or the ready deadline passes.
+                if process.poll() is not None:
+                    process.wait()
+                    raise SessionError(
+                        f"dosbox-x exited before the control pipe was ready: {exc}"
+                    ) from exc
+                if time.monotonic() >= connect_deadline:
+                    process.kill()
+                    process.wait()
+                    raise SessionError(f"failed to connect to dosbox-x: {exc}") from exc
+                time.sleep(0.1)
 
         session = cls(TransportEventSource(transport), process=process)
         session._start_reading()
