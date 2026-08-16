@@ -22,3 +22,4 @@ encode_request = hc.encode_request
 read_event_line = hc.read_event_line
 make_deadline = hc.make_deadline
 remaining_seconds = hc.remaining_seconds
+wait_for_readable = hc.wait_for_readable
