@@ -299,7 +299,7 @@ jobs:
         run: |
           top=`pwd`
           ln -s $top/build-scripts/mingw/lowend-bin/make.exe /usr/bin/make.exe
-          ./build-mingw
+          ./build-scripts/build-mingw
           strip -s $top/src/dosbox-x.exe
           mkdir -p $top/package/
           mkdir -p $top/mingw-x86-bin/
@@ -308,7 +308,7 @@ jobs:
       - name: Build MinGW32 SDL2
         run: |
           top=`pwd`
-          ./build-mingw-sdl2
+          ./build-scripts/build-mingw-sdl2
           strip -s $top/src/dosbox-x.exe
           cp $top/src/dosbox-x.exe $top/package/dosbox-x_MinGWx86_SDL2.exe
           cp $top/src/dosbox-x.exe $top/mingw-x86-bin/dosbox-x_MinGWx86_SDL2.exe
@@ -358,7 +358,7 @@ jobs:
       - name: Build MinGW64 SDL1
         run: |
           top=`pwd`
-          ./build-mingw
+          ./build-scripts/build-mingw
           strip -s $top/src/dosbox-x.exe
           mkdir -p $top/package/
           mkdir -p $top/mingw-x64-bin/
@@ -367,7 +367,7 @@ jobs:
       - name: Build MinGW64 SDL2
         run: |
           top=`pwd`
-          ./build-mingw-sdl2
+          ./build-scripts/build-mingw-sdl2
           strip -s $top/src/dosbox-x.exe
           cp $top/src/dosbox-x.exe $top/package/dosbox-x_MinGWx64_SDL2.exe
           cp $top/src/dosbox-x.exe $top/mingw-x64-bin/dosbox-x_MinGWx64_SDL2.exe

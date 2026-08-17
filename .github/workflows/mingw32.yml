@@ -61,7 +61,7 @@ jobs:
           top=`pwd`
           export "MSYSTEM_PREFIX=/d/a/_temp/msys64/mingw32"
           # cp $top/build-scripts/mingw/lowend-bin/make.exe ${MSYSTEM_PREFIX}/bin/make.exe
-          ./build-mingw
+          ./build-scripts/build-mingw
           strip -s $top/src/dosbox-x.exe
       - name: Package MinGW32 SDL1
         run: |
@@ -91,7 +91,7 @@ jobs:
         run: |
           top=`pwd`
           export "MSYSTEM_PREFIX=/d/a/_temp/msys64/mingw32"
-          ./build-mingw-sdl2
+          ./build-scripts/build-mingw-sdl2
           strip -s $top/src/dosbox-x.exe
       - name: Package MinGW32 SDL2
         run: |
@@ -195,7 +195,7 @@ jobs:
       - name: Build MinGW32 SDL1
         run: |
           top=`pwd`
-          ./build-mingw
+          ./build-scripts/build-mingw
           strip -s $top/src/dosbox-x.exe
       - name: Package MinGW32 lowend SDL1
         run: |
@@ -224,7 +224,7 @@ jobs:
       - name: Build MinGW32 lowend SDL2
         run: |
           top=`pwd`
-          ./build-mingw-sdl2
+          ./build-scripts/build-mingw-sdl2
           strip -s $top/src/dosbox-x.exe
       - name: Package MinGW32 lowend SDL2
         run: |
@@ -329,7 +329,7 @@ jobs:
       - name: Build MinGW32 lowend9x
         run: |
           top=`pwd`
-          ./build-mingw-lowend9x
+          ./build-scripts/build-mingw-lowend9x
           strip -s $top/src/dosbox-x.exe
       - name: Package MinGW32 lowend9x
         run: |

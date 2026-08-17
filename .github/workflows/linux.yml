@@ -26,7 +26,7 @@ jobs:
         if: false
         run: |
           echo "timestamp=`git show -s --format=%at | xargs -I# date -d @# +%Y%m%d%H%M%S`" >> $GITHUB_ENV
-          ./build --disable-freetype --disable-libfluidsynth --disable-mt32 --disable-screenshots
+          ./build-scripts/build --disable-freetype --disable-libfluidsynth --disable-mt32 --disable-screenshots
       - name: Install libraries
         run: |
           sudo apt-get update -y
@@ -47,13 +47,13 @@ jobs:
       - name: Build Linux SDL1
         run: |
           top=`pwd`
-          ./build-debug --enable-avcodec
+          ./build-scripts/build-debug --enable-avcodec
           strip -s $top/src/dosbox-x
           cp $top/src/dosbox-x $top/src/bin/dosbox-x-sdl1
       - name: Build Linux SDL2
         run: |
           top=`pwd`
-          ./build-debug-sdl2 --enable-avcodec
+          ./build-scripts/build-debug-sdl2 --enable-avcodec
           strip -s $top/src/dosbox-x
           cp $top/src/dosbox-x $top/src/bin/dosbox-x-sdl2
       - name: Unit testing
@@ -110,13 +110,13 @@ jobs:
       - name: Build Linux SDL1
         run: |
           top=`pwd`
-          ./build-debug  --enable-force-cxx11
+          ./build-scripts/build-debug  --enable-force-cxx11
           strip -s $top/src/dosbox-x
           cp $top/src/dosbox-x $top/src/bin/dosbox-x-sdl1
       - name: Build Linux SDL2
         run: |
           top=`pwd`
-          ./build-debug-sdl2  --enable-force-cxx11
+          ./build-scripts/build-debug-sdl2  --enable-force-cxx11
           strip -s $top/src/dosbox-x
           cp $top/src/dosbox-x $top/src/bin/dosbox-x-sdl2
       - name: Unit testing

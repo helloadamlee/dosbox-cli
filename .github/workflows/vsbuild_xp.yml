@@ -198,13 +198,13 @@ jobs:
       - name: Build MinGW32 lowend SDL2
         run: |
           top=`pwd`
-          ./build-mingw-sdl2
+          ./build-scripts/build-mingw-sdl2
           strip -s src/dosbox-x.exe
           mkdir -p mingw-bin
           cp src/dosbox-x.exe mingw-bin/dosbox-x_mingw_lowend_SDL2.exe
       - name: Build MinGW32 lowend SDL1
         run: |
-          ./build-mingw
+          ./build-scripts/build-mingw
           strip -s src/dosbox-x.exe
           cp src/dosbox-x.exe mingw-bin/dosbox-x_mingw_lowend_SDL1.exe
       - name: Cache MinGW32 lowend builds (nightly)

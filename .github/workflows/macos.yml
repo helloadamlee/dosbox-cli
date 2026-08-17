@@ -43,14 +43,14 @@ jobs:
       - name: Build macOS SDL1
         run: |
           top=`pwd`
-          ./build-macos
+          ./build-scripts/build-macos
           strip $top/src/dosbox-x
           make dosbox-x.app
           mv dosbox-x.app $top/package/dosbox-x
       - name: Build macOS SDL2
         run: |
           top=`pwd`
-          ./build-macos-sdl2
+          ./build-scripts/build-macos-sdl2
           strip $top/src/dosbox-x
           make dosbox-x.app
           mv dosbox-x.app $top/package/dosbox-x-sdl2
@@ -114,7 +114,7 @@ jobs:
         if: steps.osfree.outputs.osfree != 'true'
         run: |
           top=`pwd`
-          ./build-macos
+          ./build-scripts/build-macos
           strip $top/src/dosbox-x
           make dosbox-x.app
           mv dosbox-x.app $top/package/dosbox-x
@@ -122,7 +122,7 @@ jobs:
         if: steps.osfree.outputs.osfree != 'true'
         run: |
           top=`pwd`
-          ./build-macos-sdl2
+          ./build-scripts/build-macos-sdl2
           strip $top/src/dosbox-x
           make dosbox-x.app
           mv dosbox-x.app $top/package/dosbox-x-sdl2
@@ -183,14 +183,14 @@ jobs:
       - name: Build macOS SDL1
         run: |
           top=`pwd`
-          ./build-macos
+          ./build-scripts/build-macos
           strip $top/src/dosbox-x
           make dosbox-x.app
           mv dosbox-x.app $top/package/dosbox-x
       - name: Build macOS SDL2
         run: |
           top=`pwd`
-          ./build-macos-sdl2
+          ./build-scripts/build-macos-sdl2
           strip $top/src/dosbox-x
           make dosbox-x.app
           mv dosbox-x.app $top/package/dosbox-x-sdl2
@@ -254,14 +254,14 @@ jobs:
         if: steps.osfree.outputs.osfree != 'true'
         run: |
           top=`pwd`
-          ./build-macos
+          ./build-scripts/build-macos
           strip $top/src/dosbox-x
           make dosbox-x.app
           mv dosbox-x.app $top/package/dosbox-x
       - name: Build macOS ARM SDL2 OSFREE
         run: |
           top=`pwd`
-          ./build-macos-sdl2
+          ./build-scripts/build-macos-sdl2
           strip $top/src/dosbox-x
           make dosbox-x.app
           mv dosbox-x.app $top/package/dosbox-x-sdl2
