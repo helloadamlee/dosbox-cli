@@ -26,6 +26,19 @@ def smoke(bundle_root):
     # installed package rather than any local source tree.
     from dosbox_mcp.session import DosboxSession
 
+    # The console script's entry point, imported explicitly. Everything below
+    # exercises dosbox_mcp.session only, so a server.py that cannot import --
+    # e.g. because a dependency dropped the API it is built on -- would sail
+    # through the rest of this check while `dosbox-mcp` is dead on arrival.
+    try:
+        from dosbox_mcp.server import main as _entry_point
+    except Exception as exc:
+        raise SystemExit(
+            f"FAIL: the dosbox-mcp entry point does not import: {exc!r}"
+        )
+    if not callable(_entry_point):
+        raise SystemExit("FAIL: dosbox_mcp.server:main is not callable")
+
     session, setup_results = DosboxSession.launch(cwd=str(bundle_root))
     try:
         for step in setup_results:
