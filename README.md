@@ -69,7 +69,25 @@ drive from scripts, test harnesses, or LLM agents that want to run DOS programs 
 read structured results back. This fork adds that interface without touching the
 emulation core.
 
+## Download
+
+Prebuilt bundles for Windows and Linux are on the
+[Releases page](https://github.com/helloadamlee/dosbox-cli/releases) — each
+contains the emulator, the MCP server, and a `QUICKSTART.md`. No compiler
+required:
+
+```bash
+# unzip, then:
+pip install ./mcp-server
+```
+
+Then point your MCP client at `dosbox-mcp`, setting `DOSBOX_X_BINARY` to the
+bundled binary. Full steps are in the bundle's `QUICKSTART.md`.
+
 ## Building
+
+Building from source is only necessary for platforms without a prebuilt bundle
+(macOS, ARM, BSD), or when working on the emulator itself.
 
 This is a DOSBox-X source fork, so upstream build instructions apply — see
 [`BUILD.md`](BUILD.md) and [`INSTALL.md`](INSTALL.md). Platform build scripts live in

@@ -9,14 +9,28 @@ Design background: `docs/superpowers/specs/2026-08-16-dosbox-mcp-server-design.m
 
 ## Install
 
+**From a release bundle** (recommended — no compiler needed):
+
+```bash
+pip install ./mcp-server
+```
+
+The bundle carries a vendored copy of `host_control_client.py`, so this works
+as a normal install.
+
+**From a repo checkout** (for development):
+
 ```bash
 cd mcp-server
 pip install -e .
 ```
 
-This installs the `dosbox-mcp` console script and depends on the sibling
-`scripts/host_control_client.py` in this same repo checkout — it is not
-usable installed standalone outside this repo.
+An editable install keeps the package next to its sibling `scripts/` directory,
+which is where it finds `host_control_client.py` in a checkout.
+
+Either way, set `DOSBOX_X_BINARY` to a host-control-capable `dosbox-x` binary —
+one from a release bundle or your own build of this fork. A stock DOSBox-X
+install will not work; it has no host-control support.
 
 ## Register with an MCP client
 
