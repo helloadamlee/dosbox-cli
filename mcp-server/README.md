@@ -41,11 +41,18 @@ reads a `command`/`args` server entry):
 {
   "mcpServers": {
     "dosbox-x": {
-      "command": "dosbox-mcp"
+      "command": "dosbox-mcp",
+      "env": {
+        "DOSBOX_X_BINARY": "/path/to/host-control-capable/dosbox-x"
+      }
     }
   }
 }
 ```
+
+`DOSBOX_X_BINARY` is optional if a candidate binary is already on `PATH` or
+in one of the built-in search locations (see `binary_discovery.py`), but
+setting it explicitly avoids picking up a stock DOSBox-X install by mistake.
 
 ## Tools
 

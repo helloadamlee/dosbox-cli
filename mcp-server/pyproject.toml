@@ -1,6 +1,6 @@
 [project]
 name = "dosbox-x-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP server wrapping DOSBox-X host-control for agentic DOS automation"
 # 3.10, not 3.9: every mcp release in the range below (1.2.0 through 2.0.0)
 # declares Requires-Python >=3.10, so a 3.9 install fails to resolve mcp at
