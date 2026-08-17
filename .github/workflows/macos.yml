@@ -97,7 +97,7 @@ jobs:
           path: "${{ github.workspace }}/${{ env.ZIPNAME }}"
       - name: Upload release package
         uses: softprops/action-gh-release@v3
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/dosbox-x-v')
         with:
           files: ${{ env.ZIPNAME }}
       - name: Prepare macOS osfree build
@@ -237,7 +237,7 @@ jobs:
           path: "${{ github.workspace }}/${{ env.ZIPNAME }}"
       - name: Upload release package
         uses: softprops/action-gh-release@v3
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/dosbox-x-v')
         with:
           files: ${{ env.ZIPNAME }}
       - name: Prepare macOS ARM osfree build

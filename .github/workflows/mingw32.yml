@@ -135,7 +135,7 @@ jobs:
           path: ${{ github.workspace }}/package/
       - name: Upload release package
         uses: softprops/action-gh-release@v3
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/dosbox-x-v')
         with:
           files: ${{ env.ZIPNAME }}
   
@@ -268,7 +268,7 @@ jobs:
           path: ${{ github.workspace }}/package/
       - name: Upload release package
         uses: softprops/action-gh-release@v3
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/dosbox-x-v')
         with:
           files: ${{ env.ZIPNAME }}
           
@@ -373,6 +373,6 @@ jobs:
           path: ${{ github.workspace }}/package/
       - name: Upload release package
         uses: softprops/action-gh-release@v3
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/dosbox-x-v')
         with:
           files: ${{ env.ZIPNAME }}
