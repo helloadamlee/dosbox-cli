@@ -537,3 +537,17 @@ The DOSBox-X configure script accepts the following switches, which you can use 
 * --disable-unaligned-memory
         
         Disables unaligned memory access.
+
+## Cloning on Windows
+
+Git for Windows normally disables filemode tracking, but if your clone has
+`core.filemode=true`, git compares committed permissions against NTFS (which
+reports nothing as executable) and invents ~210 phantom `100755 -> 100644`
+modifications. Committing those strips the executable bit from every build
+script and breaks the Linux and macOS CI jobs with "Permission denied".
+
+Set this once per clone:
+
+    git config core.filemode false
+
+This affects only your local working copy; committed permissions are unchanged.
