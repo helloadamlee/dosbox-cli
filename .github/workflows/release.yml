@@ -97,14 +97,17 @@ jobs:
             echo "VERSION=0.0.0-dispatch" >> $GITHUB_ENV
           fi
 
+      # No libav*/libsw* -dev packages on purpose. Linking FFmpeg pins the
+      # bundle to one ffmpeg generation: a binary built here against
+      # libavcodec.so.60 (ffmpeg 6.x, Ubuntu 24.04) will not start on a
+      # distro shipping ffmpeg 8.x, because .so.62 does not satisfy .so.60
+      # and no compatible package exists there. See --disable-avcodec below.
       - name: Install build dependencies
         run: |
           sudo apt-get update -y
           sudo apt-get install -y nasm fluidsynth libfluidsynth-dev libpcap-dev \
             libslirp-dev libsdl-net1.2-dev libsdl2-net-dev libglu1-mesa-dev \
-            freeglut3-dev mesa-common-dev libpng-dev libavcodec-dev \
-            libavformat-dev libavutil-dev libswscale-dev libavdevice-dev \
-            libavcodec-extra
+            freeglut3-dev mesa-common-dev libpng-dev
 
       - name: Update build info
         run: |
@@ -116,11 +119,22 @@ jobs:
           echo "#define GIT_COMMIT_HASH \"${shortsha}\"" >> include/build_timestamp.h
           echo "#define COPYRIGHT_END_YEAR \"${copyrightyear}\"" >> include/build_timestamp.h
 
+      # --disable-avcodec: configure.ac:1411 defaults FFmpeg support to ON,
+      # so without this the build links it whenever the -dev headers are
+      # present. It only provides video capture to AVI, which the
+      # host-control/MCP use case never exercises, and it is the single
+      # biggest portability constraint on the Linux bundle.
       - name: Build SDL2 release
         run: |
-          ./build-scripts/build-sdl2
+          ./build-scripts/build-sdl2 --disable-avcodec
           test -f src/dosbox-x
           strip -s src/dosbox-x
+          echo "--- runtime shared libraries ---"
+          ldd src/dosbox-x
+          if ldd src/dosbox-x | grep -qiE "libav(codec|format|util|device)|libswscale"; then
+            echo "FAIL: binary still links FFmpeg; the bundle would be pinned to one ffmpeg generation"
+            exit 1
+          fi
 
       - name: Stage emulator payload
         run: |

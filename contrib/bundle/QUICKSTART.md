@@ -18,6 +18,22 @@ QUICKSTART.md    this file
 - An MCP-capable client (Claude Code, Claude Desktop, or any host that reads
   a `command`/`env` server entry)
 
+**Linux only — system libraries.** The emulator is dynamically linked, so a
+minimal or freshly installed system needs these before it will start:
+
+```bash
+sudo apt-get install -y libsdl2-2.0-0 libsdl2-net-2.0-0 libasound2t64 \
+    libncurses6 libpcap0.8 libslirp0 libfluidsynth3
+```
+
+On older releases `libasound2t64` is called `libasound2`. For non-Debian
+distros, install the equivalent SDL2, SDL2_net, ALSA, ncurses, libpcap,
+libslirp and FluidSynth runtime packages.
+
+If the emulator fails to start, run `ldd dosbox-x/dosbox-x` and look for
+`not found` — that names the missing package directly. Windows needs none of
+this; everything it requires is in the bundle.
+
 ## 2. Install the server
 
 From inside this unzipped folder:
