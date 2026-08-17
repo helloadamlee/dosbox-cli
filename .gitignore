@@ -157,3 +157,7 @@ __pycache__/
 
 # Injected at packaging time by scripts/assemble_bundle.py
 mcp-server/dosbox_mcp/_vendor/host_control_client.py
+
+# setuptools build tree, left behind by the `pip install -e .` dev flow
+# documented in mcp-server/README.md
+mcp-server/build/
