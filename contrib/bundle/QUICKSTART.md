@@ -14,7 +14,7 @@ QUICKSTART.md    this file
 
 ## 1. Requirements
 
-- Python 3.9 or newer (`python --version`)
+- Python 3.10 or newer (`python --version`)
 - An MCP-capable client (Claude Code, Claude Desktop, or any host that reads
   a `command`/`env` server entry)
 
