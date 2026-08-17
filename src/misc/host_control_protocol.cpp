@@ -48,14 +48,120 @@ bool parse_json_string(const std::string &line, std::size_t &pos, std::string &v
 		switch (line[pos++]) {
 		case '\\': value += '\\'; break;
 		case '"': value += '"'; break;
+		case '/': value += '/'; break;
+		case 'b': value += '\b'; break;
+		case 'f': value += '\f'; break;
 		case 'n': value += '\n'; break;
 		case 'r': value += '\r'; break;
 		case 't': value += '\t'; break;
+		case 'u': {
+			if (pos + 4 > line.size()) {
+				return false;
+			}
+
+			uint32_t code_point = 0;
+			for (unsigned i = 0; i < 4; ++i) {
+				const char hex = line[pos++];
+				code_point <<= 4;
+				if (hex >= '0' && hex <= '9') {
+					code_point |= static_cast<uint32_t>(hex - '0');
+				} else if (hex >= 'a' && hex <= 'f') {
+					code_point |= static_cast<uint32_t>(hex - 'a' + 10);
+				} else if (hex >= 'A' && hex <= 'F') {
+					code_point |= static_cast<uint32_t>(hex - 'A' + 10);
+				} else {
+					return false;
+				}
+			}
+
+			if (code_point < 0x80u) {
+				value += static_cast<char>(code_point);
+			} else if (code_point < 0x800u) {
+				value += static_cast<char>(0xC0u | (code_point >> 6));
+				value += static_cast<char>(0x80u | (code_point & 0x3Fu));
+			} else {
+				value += static_cast<char>(0xE0u | (code_point >> 12));
+				value += static_cast<char>(0x80u | ((code_point >> 6) & 0x3Fu));
+				value += static_cast<char>(0x80u | (code_point & 0x3Fu));
+			}
+			break;
+		}
 		default: return false;
 		}
 	}
 
 	return false;
+}
+
+bool parse_json_number(const std::string &line, std::size_t &pos, std::string &value)
+{
+	const std::size_t start = pos;
+	if (pos < line.size() && line[pos] == '-') {
+		++pos;
+	}
+
+	bool any_digit = false;
+	while (pos < line.size() && std::isdigit(static_cast<unsigned char>(line[pos]))) {
+		++pos;
+		any_digit = true;
+	}
+	if (!any_digit) {
+		return false;
+	}
+
+	if (pos < line.size() && line[pos] == '.') {
+		++pos;
+		while (pos < line.size() && std::isdigit(static_cast<unsigned char>(line[pos]))) {
+			++pos;
+		}
+	}
+
+	if (pos < line.size() && (line[pos] == 'e' || line[pos] == 'E')) {
+		++pos;
+		if (pos < line.size() && (line[pos] == '+' || line[pos] == '-')) {
+			++pos;
+		}
+		bool exponent_digit = false;
+		while (pos < line.size() && std::isdigit(static_cast<unsigned char>(line[pos]))) {
+			++pos;
+			exponent_digit = true;
+		}
+		if (!exponent_digit) {
+			return false;
+		}
+	}
+
+	value.assign(line, start, pos - start);
+	return true;
+}
+
+bool parse_json_scalar_value(const std::string &line, std::size_t &pos, std::string &value)
+{
+	if (pos >= line.size()) {
+		return false;
+	}
+
+	if (line[pos] == '"') {
+		return parse_json_string(line, pos, value);
+	}
+
+	if (line.compare(pos, 4, "true") == 0) {
+		value = "true";
+		pos += 4;
+		return true;
+	}
+	if (line.compare(pos, 5, "false") == 0) {
+		value = "false";
+		pos += 5;
+		return true;
+	}
+	if (line.compare(pos, 4, "null") == 0) {
+		value = "null";
+		pos += 4;
+		return true;
+	}
+
+	return parse_json_number(line, pos, value);
 }
 
 bool parse_string_map(const std::string &line, std::map<std::string, std::string> &values)
@@ -93,7 +199,7 @@ bool parse_string_map(const std::string &line, std::map<std::string, std::string
 		}
 
 		std::string value;
-		if (!parse_json_string(line, pos, value)) {
+		if (!parse_json_scalar_value(line, pos, value)) {
 			return false;
 		}
 		values[key] = value;
@@ -183,7 +289,8 @@ Request parse_request_line(const std::string &line)
 
 	request.op = op_it->second;
 	if (request.op != "exec" && request.op != "status" &&
-	    request.op != "input_text" && request.op != "key") {
+	    request.op != "input_text" && request.op != "key" &&
+	    request.op != "cancel" && request.op != "break") {
 		request.error = "unsupported op";
 		return request;
 	}
@@ -196,6 +303,11 @@ Request parse_request_line(const std::string &line)
 		}
 
 		request.command = command_it->second;
+
+		const auto input_it = values.find("input");
+		if (input_it != values.end()) {
+			request.input = input_it->second;
+		}
 	}
 
 	if (request.op == "input_text") {
@@ -266,10 +378,14 @@ std::string make_exec_result_json_line(const std::string &id,
 	json += json_escape(id);
 	json += "\",\"ok\":";
 	json += ok ? "true" : "false";
+	json += ",\"cancelled\":";
+	json += result.cancelled ? "true" : "false";
 	json += ",\"shell_exit\":";
 	json += result.shell_exit ? "true" : "false";
 	json += ",\"errorlevel\":";
 	json += std::to_string(result.errorlevel);
+	json += ",\"max_errorlevel\":";
+	json += std::to_string(result.max_errorlevel);
 	json += ",\"drive\":\"";
 	json += json_escape(result.drive);
 	json += "\",\"cwd\":\"";
@@ -308,6 +424,16 @@ std::string make_input_result_json_line(const std::string &id,
 	json += ok ? "true" : "false";
 	json += ",\"queued\":";
 	json += std::to_string(queued);
+	json += "}\n";
+	return json;
+}
+
+std::string make_cancel_result_json_line(const std::string &id, const bool ok)
+{
+	std::string json = "{\"event\":\"cancel_result\",\"id\":\"";
+	json += json_escape(id);
+	json += "\",\"ok\":";
+	json += ok ? "true" : "false";
 	json += "}\n";
 	return json;
 }

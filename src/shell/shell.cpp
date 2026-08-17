@@ -69,6 +69,7 @@ extern int enablelfn, msgcodepage, lastmsgcp;
 extern uint16_t countryNo;
 extern unsigned int dosbox_shell_env_size;
 extern bool is_ttfswitched_on;
+extern bool ctrlbrk;
 bool outcon = true, usecon = true, pipetmpdev = true;
 bool shellrun = false, prepared = false, testerr = false;
 
@@ -725,6 +726,11 @@ void DOS_Shell::ParseLine(char * line) {
 void DOS_Shell::RunInternal(void) {
 	char input_line[CMD_MAXLINE] = {0};
 	while (bf) {
+		if (ctrlbrk) {
+			ctrlbrk = false;
+			while (bf) delete bf;
+			break;
+		}
 		if (bf->ReadLine(input_line)) {
 			if (echo) {
 				if (input_line[0] != '@') {

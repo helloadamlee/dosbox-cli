@@ -35,6 +35,8 @@
 #include "dos_inc.h"
 #include "shell.h"
 
+extern bool ctrlbrk;
+
 namespace host_control {
 namespace {
 
@@ -55,6 +57,10 @@ WriteLineFn active_write_line = {};
 std::deque<PendingInputCode> pending_input_codes = {};
 uint64_t next_pending_input_sequence = 0;
 std::mutex pending_input_mutex = {};
+std::atomic<bool> exec_in_progress = {false};
+std::atomic<bool> cancel_requested = {false};
+bool console_device_capture_active = false;
+uint16_t max_errorlevel_seen = 0;
 
 uint64_t get_monotonic_ms()
 {
@@ -76,6 +82,7 @@ std::string get_current_dos_path()
 void populate_command_result(CommandResult &result)
 {
 	result.errorlevel = dos.return_code;
+	result.max_errorlevel = take_max_errorlevel();
 	result.drive.assign(1, static_cast<char>('A' + DOS_GetDefaultDrive()));
 	result.cwd = get_current_dos_path();
 }
@@ -117,6 +124,43 @@ void reset_session_state()
 	active_write_line = {};
 	session_write_failed.store(false);
 	session_active = false;
+	exec_in_progress.store(false);
+}
+
+bool stage_exec_input(const Request &request, std::string &error)
+{
+	if (request.input.empty()) {
+		return true;
+	}
+
+	std::vector<uint16_t> codes = {};
+	if (!build_input_codes_for_text(request.input, codes, error)) {
+		return false;
+	}
+
+	const auto queued = queue_input_codes(codes);
+	if (!queued.ok) {
+		error = queued.error;
+		return false;
+	}
+
+	return true;
+}
+
+bool request_cancel()
+{
+	if (!exec_in_progress.load()) {
+		return false;
+	}
+
+	ctrlbrk = true;
+	cancel_requested.store(true);
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+	if (build_input_codes_for_text(std::string(1, '\x03'), codes, error)) {
+		(void)queue_input_codes(codes);
+	}
+	return true;
 }
 
 struct DuplexSessionState {
@@ -186,6 +230,16 @@ void duplex_session_reader(DuplexSessionState &state, const ReadLineFn &read_lin
 		if (!request.ok) {
 			(void)write_duplex_session_line(
 			        state, make_error_json_line(request.id, request.error));
+			continue;
+		}
+
+		if (request.op == "cancel" || request.op == "break") {
+			const bool cancelled = request_cancel();
+			if (cancelled) {
+				(void)write_duplex_session_line(state, make_cancel_result_json_line(request.id, true));
+			} else {
+				(void)write_duplex_session_line(state, make_error_json_line(request.id, "no command is running"));
+			}
 			continue;
 		}
 
@@ -351,6 +405,16 @@ void socket_session_reader(SocketSessionState &state)
 		if (!request.ok) {
 			(void)write_socket_session_line(
 			        state, make_error_json_line(request.id, request.error));
+			continue;
+		}
+
+		if (request.op == "cancel" || request.op == "break") {
+			const bool cancelled = request_cancel();
+			if (cancelled) {
+				(void)write_socket_session_line(state, make_cancel_result_json_line(request.id, true));
+			} else {
+				(void)write_socket_session_line(state, make_error_json_line(request.id, "no command is running"));
+			}
 			continue;
 		}
 
@@ -786,7 +850,10 @@ std::string make_win32_message(const char *action, const std::string &endpoint, 
 
 bool is_windows_pipe_disconnect(const DWORD error)
 {
-	return error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA;
+	// Windows reports a closed client with any of these depending on whether
+	// the client closed its handle, exited, or was killed mid-transfer.
+	return error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA ||
+	       error == ERROR_PIPE_NOT_CONNECTED;
 }
 
 bool wait_for_windows_pipe_io(HANDLE handle,
@@ -1020,6 +1087,9 @@ void stop_windows_pipe_reader(WindowsPipeSessionState &state)
 	state.disconnected.store(true);
 	if (state.handle != INVALID_HANDLE_VALUE) {
 		(void)CancelIoEx(state.handle, nullptr);
+		/* Flush the kernel pipe buffer before severing the connection so that
+		 * any bytes the client has not read yet are not discarded. */
+		(void)FlushFileBuffers(state.handle);
 		(void)DisconnectNamedPipe(state.handle);
 	}
 }
@@ -1122,6 +1192,22 @@ SessionResult run_control_session(const Options &options,
 			continue;
 		}
 
+		if (request.op == "cancel" || request.op == "break") {
+			const bool cancelled = request_cancel();
+			if (!cancelled) {
+				if (!emit_session_line(make_error_json_line(request.id, "no command is running"))) {
+					result.had_io_error = true;
+					break;
+				}
+				continue;
+			}
+			if (!emit_session_line(make_cancel_result_json_line(request.id, true))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
 		if (request.op != "exec") {
 			if (!emit_session_line(make_error_json_line(request.id, "unsupported op"))) {
 				result.had_io_error = true;
@@ -1133,8 +1219,25 @@ SessionResult run_control_session(const Options &options,
 		CommandResult command_result = {};
 		active_request_id = request.id;
 		reset_buffered_output(buffered_output, request.id);
+		std::string stage_error = {};
+		if (!stage_exec_input(request, stage_error)) {
+			active_request_id.clear();
+			if (!emit_session_line(make_error_json_line(request.id, stage_error))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+		reset_max_errorlevel();
+		cancel_requested.store(false);
+		exec_in_progress.store(true);
 		const auto start_ms = get_monotonic_ms();
 		const bool ok = exec_request(request, command_result);
+		exec_in_progress.store(false);
+		command_result.cancelled = cancel_requested.exchange(false);
+		if (command_result.cancelled) {
+			clear_queued_input();
+		}
 		const auto end_ms = get_monotonic_ms();
 		command_result.duration_ms = end_ms >= start_ms ? (end_ms - start_ms) : 0;
 		if (session_write_failed.load() ||
@@ -1217,6 +1320,22 @@ SessionResult run_control_duplex_session(const Options &options,
 			continue;
 		}
 
+		if (request.op == "cancel" || request.op == "break") {
+			const bool cancelled = request_cancel();
+			if (!cancelled) {
+				if (!emit_session_line(make_error_json_line(request.id, "no command is running"))) {
+					result.had_io_error = true;
+					break;
+				}
+				continue;
+			}
+			if (!emit_session_line(make_cancel_result_json_line(request.id, true))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
 		if (request.op != "exec") {
 			if (!emit_session_line(make_error_json_line(request.id, "unsupported op"))) {
 				result.had_io_error = true;
@@ -1228,8 +1347,25 @@ SessionResult run_control_duplex_session(const Options &options,
 		CommandResult command_result = {};
 		active_request_id = request.id;
 		reset_buffered_output(buffered_output, request.id);
+		std::string stage_error = {};
+		if (!stage_exec_input(request, stage_error)) {
+			active_request_id.clear();
+			if (!emit_session_line(make_error_json_line(request.id, stage_error))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+		reset_max_errorlevel();
+		cancel_requested.store(false);
+		exec_in_progress.store(true);
 		const auto start_ms = get_monotonic_ms();
 		const bool ok = exec_request(request, command_result);
+		exec_in_progress.store(false);
+		command_result.cancelled = cancel_requested.exchange(false);
+		if (command_result.cancelled) {
+			clear_queued_input();
+		}
 		const auto end_ms = get_monotonic_ms();
 		command_result.duration_ms = end_ms >= start_ms ? (end_ms - start_ms) : 0;
 		if (is_duplex_session_disconnected(state, peer_disconnected)) {
@@ -1337,6 +1473,22 @@ SessionResult run_control_socket_session(const Options &options,
 			continue;
 		}
 
+		if (request.op == "cancel" || request.op == "break") {
+			const bool cancelled = request_cancel();
+			if (!cancelled) {
+				if (!emit_session_line(make_error_json_line(request.id, "no command is running"))) {
+					result.had_io_error = true;
+					break;
+				}
+				continue;
+			}
+			if (!emit_session_line(make_cancel_result_json_line(request.id, true))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+
 		if (request.op != "exec") {
 			if (!emit_session_line(make_error_json_line(request.id, "unsupported op"))) {
 				result.had_io_error = true;
@@ -1348,8 +1500,25 @@ SessionResult run_control_socket_session(const Options &options,
 		CommandResult command_result = {};
 		active_request_id = request.id;
 		reset_buffered_output(buffered_output, request.id);
+		std::string stage_error = {};
+		if (!stage_exec_input(request, stage_error)) {
+			active_request_id.clear();
+			if (!emit_session_line(make_error_json_line(request.id, stage_error))) {
+				result.had_io_error = true;
+				break;
+			}
+			continue;
+		}
+		reset_max_errorlevel();
+		cancel_requested.store(false);
+		exec_in_progress.store(true);
 		const auto start_ms = get_monotonic_ms();
 		const bool ok = exec_request(request, command_result);
+		exec_in_progress.store(false);
+		command_result.cancelled = cancel_requested.exchange(false);
+		if (command_result.cancelled) {
+			clear_queued_input();
+		}
 		const auto end_ms = get_monotonic_ms();
 		command_result.duration_ms = end_ms >= start_ms ? (end_ms - start_ms) : 0;
 		if (has_socket_session_peer_disconnected(state)) {
@@ -1855,8 +2024,24 @@ bool build_input_codes_for_text(const std::string &text,
 			codes.push_back(0x1c0d);
 			continue;
 		}
+		if (byte == '\t') {
+			codes.push_back(0x0f09);
+			continue;
+		}
+		if (byte == '\b') {
+			codes.push_back(0x0e08);
+			continue;
+		}
+		if (byte == 0x03) { /* Ctrl-C */
+			codes.push_back(0x2e03);
+			continue;
+		}
+		if (byte == 0x1a) { /* Ctrl-Z */
+			codes.push_back(0x2c1a);
+			continue;
+		}
 		if (byte < 0x20 || byte > 0x7e) {
-			error = "input_text supports ASCII only";
+			error = "input_text supports printable ASCII plus tab, backspace, Ctrl-C, and Ctrl-Z";
 			codes.clear();
 			return false;
 		}
@@ -1977,6 +2162,61 @@ void capture_dos_write(const uint16_t info, const char *name, const uint8_t *dat
 	            buffered_output, now_ms, buffered_output_max_bytes, buffered_output_max_ms)) {
 		(void)emit_session_line(flush_buffered_output_json_line(buffered_output));
 	}
+}
+
+void flush_buffered_output_if_due()
+{
+	if (!session_active || active_request_id.empty()) {
+		return;
+	}
+
+	const auto now_ms = get_monotonic_ms();
+	if (should_flush_buffered_output(
+	            buffered_output, now_ms, buffered_output_max_bytes, buffered_output_max_ms)) {
+		(void)emit_session_line(flush_buffered_output_json_line(buffered_output));
+	}
+}
+
+void capture_tty_output(const uint8_t byte)
+{
+	if (!session_active || active_request_id.empty()) {
+		return;
+	}
+
+	if (console_device_capture_active) {
+		return;
+	}
+
+	const auto now_ms = get_monotonic_ms();
+	append_buffered_output(buffered_output, &byte, 1, now_ms);
+	if (should_flush_buffered_output(
+	            buffered_output, now_ms, buffered_output_max_bytes, buffered_output_max_ms)) {
+		(void)emit_session_line(flush_buffered_output_json_line(buffered_output));
+	}
+}
+
+void set_console_device_capture(const bool active)
+{
+	console_device_capture_active = active;
+}
+
+void reset_max_errorlevel()
+{
+	max_errorlevel_seen = 0;
+}
+
+void track_dos_errorlevel(const uint16_t errorlevel)
+{
+	if (errorlevel > max_errorlevel_seen) {
+		max_errorlevel_seen = errorlevel;
+	}
+}
+
+uint16_t take_max_errorlevel()
+{
+	const auto value = max_errorlevel_seen;
+	max_errorlevel_seen = 0;
+	return value;
 }
 
 } // namespace host_control

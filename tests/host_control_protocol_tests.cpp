@@ -327,7 +327,7 @@ TEST(HostControlProtocolTest, RejectsNonAsciiInputText)
 
 	EXPECT_FALSE(host_control::build_input_codes_for_text(std::string("\xC3\xA9", 2), codes, error));
 	EXPECT_TRUE(codes.empty());
-	EXPECT_EQ(error, "input_text supports ASCII only");
+	EXPECT_EQ(error, "input_text supports printable ASCII plus tab, backspace, Ctrl-C, and Ctrl-Z");
 }
 
 TEST(HostControlProtocolTest, BuildsEnterCodeForCarriageReturn)
@@ -348,7 +348,7 @@ TEST(HostControlProtocolTest, RejectsControlByteInputText)
 
 	EXPECT_FALSE(host_control::build_input_codes_for_text(std::string("\x1b", 1), codes, error));
 	EXPECT_TRUE(codes.empty());
-	EXPECT_EQ(error, "input_text supports ASCII only");
+	EXPECT_EQ(error, "input_text supports printable ASCII plus tab, backspace, Ctrl-C, and Ctrl-Z");
 }
 
 TEST(HostControlProtocolTest, BuildsNamedKeyCodes)
@@ -501,7 +501,7 @@ TEST(HostControlProtocolTest, ExecResultLineReportsShellState)
 	result.duration_ms = 183;
 
 	EXPECT_EQ(host_control::make_exec_result_json_line("42", true, result),
-	          "{\"event\":\"result\",\"id\":\"42\",\"ok\":true,\"shell_exit\":false,\"errorlevel\":0,\"drive\":\"C\",\"cwd\":\"C:\\\\XCODE101L\",\"duration_ms\":183}\n");
+	          "{\"event\":\"result\",\"id\":\"42\",\"ok\":true,\"cancelled\":false,\"shell_exit\":false,\"errorlevel\":0,\"max_errorlevel\":0,\"drive\":\"C\",\"cwd\":\"C:\\\\XCODE101L\",\"duration_ms\":183}\n");
 
 	result.shell_exit = true;
 	result.errorlevel = 7;
@@ -510,7 +510,7 @@ TEST(HostControlProtocolTest, ExecResultLineReportsShellState)
 	result.duration_ms = 0;
 
 	EXPECT_EQ(host_control::make_exec_result_json_line("43", false, result),
-	          "{\"event\":\"result\",\"id\":\"43\",\"ok\":false,\"shell_exit\":true,\"errorlevel\":7,\"drive\":\"Z\",\"cwd\":\"Z:\\\\\",\"duration_ms\":0}\n");
+	          "{\"event\":\"result\",\"id\":\"43\",\"ok\":false,\"cancelled\":false,\"shell_exit\":true,\"errorlevel\":7,\"max_errorlevel\":0,\"drive\":\"Z\",\"cwd\":\"Z:\\\\\",\"duration_ms\":0}\n");
 }
 
 TEST(HostControlProtocolTest, ExecResultEscapesStructuredPathFields)
@@ -523,7 +523,7 @@ TEST(HostControlProtocolTest, ExecResultEscapesStructuredPathFields)
 	result.duration_ms = 44;
 
 	EXPECT_EQ(host_control::make_exec_result_json_line("77", true, result),
-	          "{\"event\":\"result\",\"id\":\"77\",\"ok\":true,\"shell_exit\":false,\"errorlevel\":3,\"drive\":\"C\",\"cwd\":\"C:\\\\TMP\\\\\\\"QUOTED\\\"\",\"duration_ms\":44}\n");
+	          "{\"event\":\"result\",\"id\":\"77\",\"ok\":true,\"cancelled\":false,\"shell_exit\":false,\"errorlevel\":3,\"max_errorlevel\":0,\"drive\":\"C\",\"cwd\":\"C:\\\\TMP\\\\\\\"QUOTED\\\"\",\"duration_ms\":44}\n");
 }
 
 TEST(HostControlProtocolTest, OutputBytesUseBase64Encoding)
@@ -1056,6 +1056,144 @@ TEST(HostControlProtocolTest, SessionRunnerEmitsStructuredResultMetadata)
 	EXPECT_NE(writes[1].find("\"drive\":\"Z\""), std::string::npos);
 	EXPECT_NE(writes[1].find("\"cwd\":\"Z:\\\\BUILD\""), std::string::npos);
 	EXPECT_EQ(writes[1].find("\"duration_ms\":0"), std::string::npos);
+}
+
+TEST(HostControlProtocolTest, ParsesExecRequestWithInput)
+{
+	const auto request = host_control::parse_request_line(R"({"id":"42","op":"exec","command":"del *.obj","input":"Y\r"})");
+
+	EXPECT_TRUE(request.ok);
+	EXPECT_EQ(request.id, "42");
+	EXPECT_EQ(request.op, "exec");
+	EXPECT_EQ(request.command, "del *.obj");
+	EXPECT_EQ(request.input, "Y\r");
+	EXPECT_TRUE(request.error.empty());
+}
+
+TEST(HostControlProtocolTest, ParsesNumericAndBooleanValues)
+{
+	const auto request = host_control::parse_request_line(R"({"id":42,"op":"exec","command":"dir","verbose":true,"timeout":30})");
+
+	EXPECT_TRUE(request.ok);
+	EXPECT_EQ(request.id, "42");
+	EXPECT_EQ(request.op, "exec");
+	EXPECT_EQ(request.command, "dir");
+	EXPECT_TRUE(request.error.empty());
+}
+
+TEST(HostControlProtocolTest, ParsesUnicodeAndSlashEscapes)
+{
+	const auto request = host_control::parse_request_line(R"({"id":"1","op":"exec","command":"dir\u0020\/w"})");
+
+	EXPECT_TRUE(request.ok);
+	EXPECT_EQ(request.command, "dir /w");
+	EXPECT_TRUE(request.error.empty());
+}
+
+TEST(HostControlProtocolTest, ParsesCancelRequest)
+{
+	const auto request = host_control::parse_request_line(R"({"id":"9","op":"cancel"})");
+
+	EXPECT_TRUE(request.ok);
+	EXPECT_EQ(request.op, "cancel");
+	EXPECT_TRUE(request.error.empty());
+}
+
+TEST(HostControlProtocolTest, BuildsControlInputCodesForText)
+{
+	std::vector<uint16_t> codes = {};
+	std::string error = {};
+
+	EXPECT_TRUE(host_control::build_input_codes_for_text(std::string("\t\b\x03\x1a", 4), codes, error));
+	ASSERT_EQ(codes.size(), 4u);
+	EXPECT_EQ(codes[0], 0x0f09); // Tab
+	EXPECT_EQ(codes[1], 0x0e08); // Backspace
+	EXPECT_EQ(codes[2], 0x2e03); // Ctrl-C
+	EXPECT_EQ(codes[3], 0x2c1a); // Ctrl-Z
+	EXPECT_TRUE(error.empty());
+}
+
+TEST(HostControlProtocolTest, ExecResultLineReportsMaxErrorlevel)
+{
+	host_control::CommandResult result = {};
+	result.shell_exit = false;
+	result.errorlevel = 0;
+	result.max_errorlevel = 5;
+	result.drive = "C";
+	result.cwd = "C:\\";
+	result.duration_ms = 0;
+
+	const auto line = host_control::make_exec_result_json_line("42", true, result);
+	EXPECT_NE(line.find("\"max_errorlevel\":5"), std::string::npos);
+}
+
+TEST(HostControlProtocolTest, SessionRunnerStagesExecInput)
+{
+	host_control::clear_queued_input();
+	std::vector<std::string> writes = {};
+	std::vector<std::string> requests = {R"({"id":"9","op":"exec","command":"del *.obj","input":"Y\r"})"};
+	std::size_t next_request = 0;
+	bool exec_called = false;
+
+	const auto read_line = [&](std::string &line) {
+		if (next_request >= requests.size()) {
+			line.clear();
+			return false;
+		}
+		line = requests[next_request++];
+		return true;
+	};
+	const auto write_line = [&](const std::string &line) {
+		writes.push_back(line);
+		return true;
+	};
+
+	const auto session = host_control::run_control_session(
+	        {host_control::Transport::Socket, "/tmp/test.sock"},
+	        read_line,
+	        write_line,
+	        [&](const host_control::Request &request, host_control::CommandResult &result) {
+		        EXPECT_EQ(request.input, "Y\r");
+		        exec_called = true;
+		        result.shell_exit = false;
+		        return true;
+	        });
+
+	EXPECT_TRUE(session.started);
+	EXPECT_TRUE(exec_called);
+
+	std::vector<uint16_t> drained = {};
+	EXPECT_EQ(host_control::drain_queued_input_codes_for_test(drained, 8), 2u);
+	host_control::clear_queued_input();
+}
+
+TEST(HostControlProtocolTest, SessionRunnerRejectsCancelWithoutActiveCommand)
+{
+	std::vector<std::string> writes = {};
+	std::vector<std::string> requests = {R"({"id":"9","op":"cancel"})"};
+	std::size_t next_request = 0;
+
+	const auto read_line = [&](std::string &line) {
+		if (next_request >= requests.size()) {
+			line.clear();
+			return false;
+		}
+		line = requests[next_request++];
+		return true;
+	};
+	const auto write_line = [&](const std::string &line) {
+		writes.push_back(line);
+		return true;
+	};
+
+	(void)host_control::run_control_session(
+	        {host_control::Transport::Socket, "/tmp/test.sock"},
+	        read_line,
+	        write_line,
+	        [](const host_control::Request &, host_control::CommandResult &) { return false; });
+
+	ASSERT_EQ(writes.size(), 2u);
+	EXPECT_EQ(writes[1], "{\"event\":\"error\",\"id\":\"9\",\"message\":\"no command is running\"}\n");
 }
 
 TEST(HostControlPipeEndpoint, NormalizesShortWindowsName)

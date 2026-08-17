@@ -30,6 +30,7 @@ struct Request {
 	std::string command = {};
 	std::string text = {};
 	std::string key = {};
+	std::string input = {};
 	std::string error = {};
 };
 
@@ -41,7 +42,9 @@ struct BufferedOutput {
 
 struct CommandResult {
 	bool shell_exit = false;
+	bool cancelled = false;
 	uint32_t errorlevel = 0;
+	uint32_t max_errorlevel = 0;
 	std::string drive = {};
 	std::string cwd = {};
 	uint64_t duration_ms = 0;
@@ -158,6 +161,7 @@ std::string make_exec_result_json_line(const std::string &id,
                                        const CommandResult &result);
 std::string make_status_json_line(const std::string &id, const StatusSnapshot &snapshot);
 std::string make_input_result_json_line(const std::string &id, bool ok, std::size_t queued);
+std::string make_cancel_result_json_line(const std::string &id, bool ok);
 void reset_buffered_output(BufferedOutput &buffer, const std::string &request_id);
 void append_buffered_output(BufferedOutput &buffer, const uint8_t *data, std::size_t size, uint64_t now_ms);
 bool has_buffered_output(const BufferedOutput &buffer);
@@ -209,6 +213,12 @@ void clear_queued_input();
 std::size_t drain_queued_input();
 std::size_t drain_queued_input_codes_for_test(std::vector<uint16_t> &codes, std::size_t max_codes);
 void capture_dos_write(uint16_t info, const char *name, const uint8_t *data, std::size_t size);
+void capture_tty_output(uint8_t byte);
+void set_console_device_capture(bool active);
+void flush_buffered_output_if_due();
+void reset_max_errorlevel();
+void track_dos_errorlevel(uint16_t errorlevel);
+uint16_t take_max_errorlevel();
 
 } // namespace host_control
 
