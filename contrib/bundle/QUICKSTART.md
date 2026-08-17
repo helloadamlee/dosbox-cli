@@ -101,8 +101,9 @@ Restart your MCP client, then ask it to run something. Under the hood that is:
 | 3 | `poll` | repeat until `done: true`; each call returns new output |
 | 4 | `stop_session` | ends the session and the emulator process |
 
-The other two tools: `send_input` answers an interactive prompt while a
-command is running, and `cancel` interrupts a running batch file.
+The other three tools: `send_input` answers an interactive prompt while a
+command is running, `cancel` interrupts a running batch file, and `status`
+reports whether a session is active and its current DOS drive/cwd.
 
 ## Notes and limits
 

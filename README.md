@@ -19,9 +19,9 @@ DOSBox-X referenced this capability but never finished it. This fork implements 
 
 ## MCP server
 
-For agentic use, [`mcp-server/`](mcp-server/) packages the protocol as six
+For agentic use, [`mcp-server/`](mcp-server/) packages the protocol as seven
 typed MCP tools — `start_session`, `exec`, `poll`, `send_input`, `cancel`,
-`stop_session` — instead of hand-rolled NDJSON. It's async-with-polling, so
+`status`, `stop_session` — instead of hand-rolled NDJSON. It's async-with-polling, so
 no tool call blocks on a running DOS command. See
 [`mcp-server/README.md`](mcp-server/README.md) for install and the full tool
 table.
@@ -87,7 +87,9 @@ bundled binary. Full steps are in the bundle's `QUICKSTART.md`.
 ## Building
 
 Building from source is only necessary for platforms without a prebuilt bundle
-(macOS, ARM, BSD), or when working on the emulator itself.
+(macOS, ARM, BSD), for Linux older than Ubuntu 24.04 / Debian 13 (the bundle's
+glibc floor — see the bundle's `QUICKSTART.md`), or when working on the
+emulator itself.
 
 This is a DOSBox-X source fork, so upstream build instructions apply — see
 [`BUILD.md`](BUILD.md) and [`INSTALL.md`](INSTALL.md). Platform build scripts live in
