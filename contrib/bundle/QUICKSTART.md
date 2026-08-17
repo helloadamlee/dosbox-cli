@@ -18,6 +18,13 @@ QUICKSTART.md    this file
 - An MCP-capable client (Claude Code, Claude Desktop, or any host that reads
   a `command`/`env` server entry)
 
+**Linux only — minimum distro.** The emulator is built on Ubuntu 24.04 and
+needs glibc 2.38+ and libstdc++ from GCC 13+, so it runs on **Ubuntu 24.04 or
+newer, Debian 13 or newer**, and comparable releases. Newer is always fine —
+glibc is backward compatible. Older releases (Ubuntu 22.04, Debian 12) are
+not supported and fail at startup with a message naming a `GLIBC_2.xx`
+version. Build from source for those; see the project README.
+
 **Linux only — system libraries.** The emulator is dynamically linked, so a
 minimal or freshly installed system needs these before it will start:
 
@@ -26,7 +33,7 @@ sudo apt-get install -y libsdl2-2.0-0 libsdl2-net-2.0-0 libasound2t64 \
     libncurses6 libpcap0.8 libslirp0 libfluidsynth3
 ```
 
-On older releases `libasound2t64` is called `libasound2`. For non-Debian
+Those names are current for Ubuntu 24.04+ and Debian 13+. For non-Debian
 distros, install the equivalent SDL2, SDL2_net, ALSA, ncurses, libpcap,
 libslirp and FluidSynth runtime packages.
 
