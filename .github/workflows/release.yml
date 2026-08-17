@@ -1,0 +1,182 @@
+name: Release bundles
+
+on:
+  push:
+    tags:
+      - 'dosbox-cli-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-bundle:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+      - uses: microsoft/setup-msbuild@v3
+
+      # No setup-python action: windows-2022 runners ship Python 3, and this
+      # repo has no precedent pinning a setup-python version to copy.
+      - name: Derive version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/dosbox-cli-v* ]]; then
+            echo "VERSION=${GITHUB_REF##*/dosbox-cli-v}" >> $GITHUB_ENV
+          else
+            echo "VERSION=0.0.0-dispatch" >> $GITHUB_ENV
+          fi
+
+      - name: Build Release SDL2 x64
+        shell: pwsh
+        run: |
+          msbuild -m vs/dosbox-x.sln -t:dosbox-x:Rebuild -p:Configuration="Release SDL2" -p:Platform=x64
+          if (-not (Test-Path -Path "bin\x64\Release SDL2\dosbox-x.exe" -PathType Leaf)) { exit 1 }
+
+      - name: Stage emulator payload
+        shell: bash
+        run: |
+          top=`pwd`
+          payload="$top/payload"
+          mkdir -p "$payload"/{drivez,scripts,shaders,glshaders,languages}
+          cp "$top/bin/x64/Release SDL2/dosbox-x.exe" "$payload/"
+          cp $top/CHANGELOG "$payload/CHANGELOG.txt"
+          cp $top/dosbox-x.reference.conf "$payload/"
+          cp $top/dosbox-x.reference.full.conf "$payload/"
+          cp $top/contrib/windows/installer/inpoutx64.dll "$payload/"
+          cp $top/contrib/fonts/FREECG98.BMP "$payload/"
+          cp $top/contrib/fonts/wqy_1?pt.bdf "$payload/"
+          cp $top/contrib/fonts/Nouveau_IBM.ttf "$payload/"
+          cp $top/contrib/fonts/SarasaGothicFixed.ttf "$payload/"
+          cp $top/contrib/windows/installer/drivez_readme.txt "$payload/drivez/readme.txt"
+          cp $top/contrib/windows/installer/windows_explorer_context_menu*.bat "$payload/scripts/"
+          cp $top/contrib/windows/shaders/* "$payload/shaders/"
+          cp $top/contrib/glshaders/* "$payload/glshaders/"
+          cp $top/contrib/translations/*/*.lng "$payload/languages/"
+
+      - name: Assemble bundle
+        shell: bash
+        run: |
+          python scripts/assemble_bundle.py \
+            --payload-dir payload \
+            --version "${VERSION}" \
+            --platform win64 \
+            --out-dir dist
+
+      - name: Smoke-test the assembled bundle
+        shell: bash
+        run: |
+          bundle="dist/dosbox-cli-${VERSION}-win64"
+          python -m pip install --upgrade pip
+          python -m pip install "${bundle}/mcp-server"
+          python scripts/smoke_bundle.py "${bundle}"
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist\dosbox-cli-$env:VERSION-win64" `
+                           -DestinationPath "dosbox-cli-$env:VERSION-win64.zip"
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: bundle-win64
+          path: dosbox-cli-${{ env.VERSION }}-win64.zip
+
+  linux-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # No setup-python action: ubuntu-latest ships python3, and this repo
+      # has no precedent pinning a setup-python version to copy.
+      - name: Derive version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/dosbox-cli-v* ]]; then
+            echo "VERSION=${GITHUB_REF##*/dosbox-cli-v}" >> $GITHUB_ENV
+          else
+            echo "VERSION=0.0.0-dispatch" >> $GITHUB_ENV
+          fi
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y nasm fluidsynth libfluidsynth-dev libpcap-dev \
+            libslirp-dev libsdl-net1.2-dev libsdl2-net-dev libglu1-mesa-dev \
+            freeglut3-dev mesa-common-dev libpng-dev libavcodec-dev \
+            libavformat-dev libavutil-dev libswscale-dev libavdevice-dev \
+            libavcodec-extra
+
+      - name: Update build info
+        run: |
+          export shortsha=`echo ${GITHUB_SHA} | cut -c1-7`
+          export copyrightyear=`git show -s --format=%at | xargs -I# date -d @# +'%Y'`
+          export updatestr=`git show -s --format=%at | xargs -I# date -d @# +'%b %d, %Y %I:%M:%S%P'`
+          echo '/* auto generated */' > include/build_timestamp.h
+          echo "#define UPDATED_STR \"${updatestr}\"" >> include/build_timestamp.h
+          echo "#define GIT_COMMIT_HASH \"${shortsha}\"" >> include/build_timestamp.h
+          echo "#define COPYRIGHT_END_YEAR \"${copyrightyear}\"" >> include/build_timestamp.h
+
+      - name: Build SDL2 release
+        run: |
+          ./build-scripts/build-sdl2
+          test -f src/dosbox-x
+          strip -s src/dosbox-x
+
+      - name: Stage emulator payload
+        run: |
+          top=`pwd`
+          payload="$top/payload"
+          mkdir -p "$payload"/{shaders,glshaders,languages}
+          cp $top/src/dosbox-x "$payload/dosbox-x"
+          chmod +x "$payload/dosbox-x"
+          cp $top/CHANGELOG "$payload/CHANGELOG.txt"
+          cp $top/dosbox-x.reference.conf "$payload/"
+          cp $top/dosbox-x.reference.full.conf "$payload/"
+          cp $top/contrib/fonts/FREECG98.BMP "$payload/"
+          cp $top/contrib/fonts/wqy_1?pt.bdf "$payload/"
+          cp $top/contrib/fonts/Nouveau_IBM.ttf "$payload/"
+          cp $top/contrib/fonts/SarasaGothicFixed.ttf "$payload/"
+          cp $top/contrib/glshaders/* "$payload/glshaders/"
+          cp $top/contrib/translations/*/*.lng "$payload/languages/"
+
+      - name: Assemble bundle
+        run: |
+          python3 scripts/assemble_bundle.py \
+            --payload-dir payload \
+            --version "${VERSION}" \
+            --platform linux-x86_64 \
+            --out-dir dist
+
+      - name: Smoke-test the assembled bundle
+        run: |
+          bundle="dist/dosbox-cli-${VERSION}-linux-x86_64"
+          python3 -m pip install --upgrade pip
+          python3 -m pip install "${bundle}/mcp-server"
+          python3 scripts/smoke_bundle.py "${bundle}"
+
+      - name: Package
+        run: |
+          tar -czf "dosbox-cli-${VERSION}-linux-x86_64.tar.gz" \
+            -C dist "dosbox-cli-${VERSION}-linux-x86_64"
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: bundle-linux-x86_64
+          path: dosbox-cli-${{ env.VERSION }}-linux-x86_64.tar.gz
+
+  publish:
+    needs: [windows-bundle, linux-bundle]
+    if: startsWith(github.ref, 'refs/tags/dosbox-cli-v')
+    runs-on: ubuntu-latest
+    steps:
+      # v7 pairs with the upload-artifact@v7.0.1 used above and elsewhere in
+      # this repo — upload and download are versioned in lockstep, and a
+      # mismatched major will not find the artifacts.
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
