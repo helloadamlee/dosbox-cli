@@ -144,6 +144,8 @@ contrib/macos/dosbox-x.plist
 
 # local linked worktrees used for feature isolation
 /.worktrees/
+/.codex/cocoindex-venv/
+/.cocoindex_code/
 
 # Host-control release-gate and test artifacts
 /artifact-provenance.json
@@ -152,3 +154,6 @@ contrib/macos/dosbox-x.plist
 /tests_*.xml
 /build*.log
 __pycache__/
+
+# Injected at packaging time by scripts/assemble_bundle.py
+mcp-server/dosbox_mcp/_vendor/host_control_client.py
