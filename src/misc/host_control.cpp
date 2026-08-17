@@ -2219,4 +2219,9 @@ uint16_t take_max_errorlevel()
 	return value;
 }
 
+bool is_cancel_requested()
+{
+	return cancel_requested.load();
+}
+
 } // namespace host_control

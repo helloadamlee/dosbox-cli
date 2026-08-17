@@ -1,10 +1,14 @@
 """Owns one DOSBox-X process and its host-control session."""
 
 import json
+import os
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 
 from ._client_import import (
     PipeTransport,
@@ -85,9 +89,10 @@ class DosboxSession:
     with a fake event source and no process, bypassing all real I/O.
     """
 
-    def __init__(self, source, process=None):
+    def __init__(self, source, process=None, endpoint_dir=None):
         self._source = source
         self.process = process
+        self._endpoint_dir = endpoint_dir
         self.state = SessionState()
         self._next_request_id = 1
         self._reader_thread = None
@@ -108,7 +113,21 @@ class DosboxSession:
         except BinaryNotFoundError as exc:
             raise SessionError(str(exc)) from exc
 
-        endpoint = f"dosbox-mcp-{uuid.uuid4().hex[:12]}"
+        # On Windows, named pipes live in a global "\\.\pipe\" namespace, so a
+        # bare name is unambiguous regardless of either process's cwd. On
+        # every other platform, "-control-pipe" makes dosbox-x create
+        # "<endpoint>.in"/".out" FIFOs relative to *its* cwd (the `cwd` we
+        # pass to Popen below) — but PipeTransport's os.open() would resolve
+        # that same relative name against *this* process's own cwd, which is
+        # unrelated. Use an absolute path in a dedicated tempdir so both
+        # sides agree regardless of either one's working directory.
+        endpoint_dir = None
+        if os.name == "nt":
+            endpoint = f"dosbox-mcp-{uuid.uuid4().hex[:12]}"
+        else:
+            endpoint_dir = tempfile.mkdtemp(prefix="dosbox-mcp-")
+            endpoint = str(Path(endpoint_dir) / "control")
+
         args = [str(binary), "-control-pipe", endpoint, "-headless"]
         if config_path is not None:
             args += ["-conf", str(config_path)]
@@ -120,29 +139,38 @@ class DosboxSession:
             stderr=subprocess.DEVNULL,
         )
 
-        transport = PipeTransport(endpoint, timeout=_READY_TIMEOUT)
+        transport = None
         connect_deadline = time.monotonic() + _READY_TIMEOUT
         while True:
             try:
+                # On Windows, CreateFile (in transport.connect()) reports
+                # ERROR_FILE_NOT_FOUND until the server creates its named
+                # pipe. On other platforms, opening the FIFOs happens in
+                # PipeTransport's own constructor, raising OSError until
+                # dosbox-x creates them. Retrying the whole construction
+                # covers both races the same way.
+                transport = PipeTransport(endpoint, timeout=_READY_TIMEOUT)
                 transport.connect()
                 break
             except OSError as exc:
-                # On Windows the server creates its named pipe a moment after
-                # the process starts; CreateFile reports ERROR_FILE_NOT_FOUND
-                # until it does. Retry until the pipe appears, the process
-                # dies, or the ready deadline passes.
                 if process.poll() is not None:
                     process.wait()
+                    if endpoint_dir is not None:
+                        shutil.rmtree(endpoint_dir, ignore_errors=True)
                     raise SessionError(
                         f"dosbox-x exited before the control pipe was ready: {exc}"
                     ) from exc
                 if time.monotonic() >= connect_deadline:
                     process.kill()
                     process.wait()
+                    if endpoint_dir is not None:
+                        shutil.rmtree(endpoint_dir, ignore_errors=True)
                     raise SessionError(f"failed to connect to dosbox-x: {exc}") from exc
                 time.sleep(0.1)
 
-        session = cls(TransportEventSource(transport), process=process)
+        session = cls(
+            TransportEventSource(transport), process=process, endpoint_dir=endpoint_dir
+        )
         session._start_reading()
 
         deadline = time.monotonic() + _READY_TIMEOUT
@@ -227,6 +255,7 @@ class DosboxSession:
                     "output": self.state.drain_output(),
                     "errorlevel": snap["errorlevel"],
                     "max_errorlevel": snap["max_errorlevel"],
+                    "cancelled": snap["cancelled"],
                     "ok": snap["ok"],
                     "bad_command": snap["bad_command"],
                     "drive": snap["drive"],
@@ -243,6 +272,20 @@ class DosboxSession:
             self._write_request("input_text", text=text)
         else:
             self._write_request("key", key=key)
+        return {"queued": True}
+
+    def cancel(self):
+        """Request cancellation of the in-flight command.
+
+        Fire-and-forget, like send_input: returns immediately with an
+        acknowledgment. The exec's result then reports cancelled: true when
+        the command actually stops. Only stops batch files / commands that
+        honor Ctrl-C; a tight emulation loop may ignore it and require
+        stop() instead.
+        """
+        if self.state.snapshot()["phase"] != SessionPhase.BUSY:
+            raise SessionError("cancel requires a command in flight")
+        self._write_request("cancel")
         return {"queued": True}
 
     def status(self):
@@ -268,5 +311,7 @@ class DosboxSession:
                 except subprocess.TimeoutExpired:
                     self.process.kill()
                     self.process.wait()
+        if self._endpoint_dir is not None:
+            shutil.rmtree(self._endpoint_dir, ignore_errors=True)
         self.state.mark_stopped()
         return {"stopped": True}

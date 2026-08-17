@@ -691,6 +691,103 @@ class HostControlClientTest(unittest.TestCase):
 
         self.assertEqual(api.read_file(101, 4096), b"")
 
+    def test_windows_pipe_disconnect_errors_cover_every_close_code(self):
+        module = load_client_module()
+
+        for error in (
+            module.ERROR_BROKEN_PIPE,
+            module.ERROR_NO_DATA,
+            module.ERROR_PIPE_NOT_CONNECTED,
+        ):
+            self.assertTrue(module.is_windows_pipe_disconnect(error), error)
+
+        for error in (module.ERROR_FILE_NOT_FOUND, module.ERROR_PIPE_BUSY, 5):
+            self.assertFalse(module.is_windows_pipe_disconnect(error), error)
+
+    def test_windows_pipe_read_maps_every_disconnect_code_to_eof(self):
+        module = load_client_module()
+
+        class ClosedKernel32:
+            @staticmethod
+            def ReadFile(handle, buffer, size, bytes_read, overlapped):
+                return 0
+
+            @staticmethod
+            def PeekNamedPipe(handle, buffer, size, read, available, left):
+                return 0
+
+        for error in (
+            module.ERROR_BROKEN_PIPE,
+            module.ERROR_NO_DATA,
+            module.ERROR_PIPE_NOT_CONNECTED,
+        ):
+            api = module.WindowsPipeApi.__new__(module.WindowsPipeApi)
+            api.kernel32 = ClosedKernel32()
+            api.get_last_error = lambda error=error: error
+
+            # A server that exits after its final event reports
+            # ERROR_PIPE_NOT_CONNECTED rather than ERROR_BROKEN_PIPE. Both mean
+            # end of session, not a transport fault.
+            self.assertEqual(api.read_file(101, 4096), b"", error)
+            self.assertIsNone(api.peek_file(101), error)
+
+    def test_windows_pipe_write_after_close_raises_session_closed(self):
+        module = load_client_module()
+        api = FailingWindowsPipeApi(module.ERROR_PIPE_NOT_CONNECTED)
+
+        with mock.patch.object(module, "WindowsPipeApi", return_value=api), \
+             mock.patch.object(module.os, "name", "nt"):
+            transport = module.PipeTransport("dosbox-control")
+            transport.handle = 101
+
+            with self.assertRaises(module.SessionClosed):
+                transport.writeline('{"id":"1","op":"status"}')
+
+    def test_read_event_line_reports_session_closed_on_eof(self):
+        module = load_client_module()
+
+        class DisconnectedWindowsPipeApi(FakeWindowsPipeApi):
+            def peek_file(self, handle):
+                return None
+
+            def read_file(self, handle, size):
+                return b""
+
+        api = DisconnectedWindowsPipeApi([101])
+
+        with mock.patch.object(module, "WindowsPipeApi", return_value=api), \
+             mock.patch.object(module.os, "name", "nt"):
+            transport = module.PipeTransport("dosbox-control")
+            transport.connect()
+
+            with self.assertRaises(module.SessionClosed):
+                module.read_event_line(transport, module.make_deadline(1), "event")
+
+    def test_workflow_refuses_requests_after_shell_exit(self):
+        module = load_client_module()
+        runtime = module.WorkflowRuntime(mock.Mock())
+
+        runtime.remember_completion(
+            {"event": "result", "id": "1", "ok": True, "shell_exit": True}
+        )
+
+        self.assertTrue(runtime.session_ended)
+        with self.assertRaises(module.WorkflowError) as caught:
+            runtime.send_request("status")
+        self.assertIn("DOS shell exited", str(caught.exception))
+
+    def test_workflow_allows_requests_when_shell_did_not_exit(self):
+        module = load_client_module()
+        transport = mock.Mock()
+        runtime = module.WorkflowRuntime(transport)
+
+        runtime.remember_completion(
+            {"event": "result", "id": "1", "ok": True, "shell_exit": False}
+        )
+
+        self.assertFalse(runtime.session_ended)
+        self.assertEqual(runtime.send_request("status"), "1")
+
     def test_make_transport_passes_timeout_to_pipe_transport(self):
         module = load_client_module()
         args = module.parse_args(["--timeout", "2.5", "pipe", "dosbox-control", "status"])

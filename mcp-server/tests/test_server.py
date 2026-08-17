@@ -33,6 +33,9 @@ class FakeSession:
     def send_input(self, text=None, key=None):
         return {"queued": True}
 
+    def cancel(self):
+        return {"queued": True}
+
     def stop(self, force=False):
         self.stopped = True
         return {"stopped": True}
@@ -92,6 +95,19 @@ def test_send_input_delegates_to_session():
     server._session = FakeSession()
 
     result = server.send_input(text="y\r")
+
+    assert result == {"queued": True}
+
+
+def test_cancel_requires_active_session():
+    with pytest.raises(SessionError):
+        server.cancel()
+
+
+def test_cancel_delegates_to_session():
+    server._session = FakeSession()
+
+    result = server.cancel()
 
     assert result == {"queued": True}
 

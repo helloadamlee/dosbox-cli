@@ -103,6 +103,41 @@ def test_send_input_requires_exactly_one_of_text_or_key():
     session.stop(force=True)
 
 
+def test_cancel_requires_busy_session():
+    session, source = make_running_session()
+
+    with pytest.raises(SessionError):
+        session.cancel()
+
+    session.stop(force=True)
+
+
+def test_cancel_sends_cancel_op_and_acknowledges():
+    session, source = make_running_session()
+    session.exec("loop.bat")
+
+    result = session.cancel()
+
+    assert result == {"queued": True}
+    assert source.written[-1] == {"id": "2", "op": "cancel"}
+
+    session.stop(force=True)
+
+
+def test_cancelled_result_flows_through_poll():
+    session, source = make_running_session()
+    session.exec("loop.bat")
+    source.push(encode_result_event(cancelled=True))
+    assert wait_until(lambda: session.state.snapshot()["done"])
+
+    result = session.poll(wait_seconds=0.5)
+
+    assert result["done"] is True
+    assert result["cancelled"] is True
+
+    session.stop(force=True)
+
+
 def test_status_reflects_last_known_drive_and_cwd():
     session, source = make_running_session()
     session.exec("c:")

@@ -36,20 +36,22 @@ reads a `command`/`args` server entry):
 ## Tools
 
 One DOSBox-X session at a time. `start_session` launches the process;
-`stop_session` is the only way to end it — there is no `cancel` for a
-running command (see "Known limitations" below).
+`stop_session` is the only way to end it. `cancel` aborts the in-flight
+command (batch files), but a command that ignores Ctrl-C still needs
+`stop_session` (see "Known limitations" below).
 
 | Tool | Parameters | Returns |
 |---|---|---|
 | `start_session` | `cwd`, `binary_path?`, `config_path?`, `mount?` (`{"drive": "c", "host_path": "..."}`), `dos_path?`, `env?` | `{session_active, drive, cwd, pid, setup_results}` |
 | `exec` | `command` | `{request_id}` — returns immediately, does not wait for completion |
-| `poll` | `wait_seconds?` (default 2, max 10) | `{running, done, output, errorlevel, max_errorlevel, ok, bad_command, drive, cwd}` |
+| `poll` | `wait_seconds?` (default 2, max 10) | `{running, done, output, errorlevel, max_errorlevel, cancelled, ok, bad_command, drive, cwd}` |
 | `send_input` | `text?` or `key?` (exactly one) | `{queued}` |
+| `cancel` | — | `{queued}` — fire-and-forget; the stopped exec's `result` then reports `cancelled: true` |
 | `status` | — | `{session_active, drive, cwd}` |
 | `stop_session` | `force?` | `{stopped}` |
 
 Typical sequence: `start_session` → `exec` → repeated `poll` until `done` →
-… → `stop_session`.
+… → `stop_session`. `cancel` interrupts a running batch mid-flight.
 
 ## Known limitations (by design, v1)
 
@@ -64,10 +66,11 @@ Typical sequence: `start_session` → `exec` → repeated `poll` until `done` �
   signal — it can miss a bad-command message split across two `output`
   events at exactly the wrong byte boundary, though this is rare in
   practice.
-- **No `cancel` tool.** The underlying protocol's `cancel`/`break` op exists
-  but doesn't actually stop a running program. A hung command must be
-  handled with `stop_session`, which kills the whole DOSBox-X process — there
-  is no way to cancel just the current command and keep the session alive.
+- **`cancel` only stops batch files / Ctrl-C-aware commands.** The protocol
+  op now works (it stops a running batch and reports `cancelled: true`), but
+  a program in a tight emulation loop with no console reads may ignore it.
+  For that case, `stop_session` — which kills the whole DOSBox-X process —
+  is the fallback.
 - **One session at a time.** A second `start_session` fails until
   `stop_session` is called.
 

@@ -79,6 +79,18 @@ def send_input(text: Optional[str] = None, key: Optional[str] = None) -> dict:
 
 
 @mcp.tool()
+def cancel() -> dict:
+    """Request cancellation of the in-flight command.
+
+    Stops a running batch file; the exec's result then reports
+    cancelled: true. Fire-and-forget acknowledgment, so poll() for the
+    outcome. A command that ignores Ctrl-C (e.g. a tight emulation loop
+    with no console reads) may not stop — stop_session is the fallback.
+    """
+    return _require_session().cancel()
+
+
+@mcp.tool()
 def status() -> dict:
     """Report whether a session is active and its current DOS drive/cwd."""
     if _session is None:
@@ -90,8 +102,8 @@ def status() -> dict:
 def stop_session(force: bool = False) -> dict:
     """Stop the active session and kill the DOSBox-X process.
 
-    This is the only way to abort a hung command — the protocol's cancel op
-    does not work (see docs/host-control-windows-pipe-roadmap.md).
+    Use this to abort a command that ignores the cancel tool (e.g. a tight
+    emulation loop) — it kills the whole DOSBox-X process.
     """
     global _session
     if _session is None:

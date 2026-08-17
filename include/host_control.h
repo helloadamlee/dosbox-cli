@@ -219,6 +219,7 @@ void flush_buffered_output_if_due();
 void reset_max_errorlevel();
 void track_dos_errorlevel(uint16_t errorlevel);
 uint16_t take_max_errorlevel();
+bool is_cancel_requested();
 
 } // namespace host_control
 

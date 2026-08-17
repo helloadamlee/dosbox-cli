@@ -9,7 +9,9 @@ def encode_output_event(text):
     return {"event": "output", "id": "1", "encoding": "base64", "data": data}
 
 
-def encode_result_event(ok=True, errorlevel=0, max_errorlevel=0, drive="C", cwd="C:\\"):
+def encode_result_event(
+    ok=True, errorlevel=0, max_errorlevel=0, drive="C", cwd="C:\\", cancelled=False
+):
     return {
         "event": "result",
         "id": "1",
@@ -17,6 +19,7 @@ def encode_result_event(ok=True, errorlevel=0, max_errorlevel=0, drive="C", cwd=
         "shell_exit": False,
         "errorlevel": errorlevel,
         "max_errorlevel": max_errorlevel,
+        "cancelled": cancelled,
         "drive": drive,
         "cwd": cwd,
         "duration_ms": 1,

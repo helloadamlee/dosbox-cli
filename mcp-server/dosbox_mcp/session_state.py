@@ -84,6 +84,7 @@ class SessionState:
                 "ok": result.get("ok"),
                 "errorlevel": result.get("errorlevel"),
                 "max_errorlevel": result.get("max_errorlevel"),
+                "cancelled": result.get("cancelled"),
                 "bad_command": self._bad_command,
                 "server_error": (
                     result.get("message") if result.get("event") == "error" else None

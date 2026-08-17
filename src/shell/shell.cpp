@@ -726,7 +726,7 @@ void DOS_Shell::ParseLine(char * line) {
 void DOS_Shell::RunInternal(void) {
 	char input_line[CMD_MAXLINE] = {0};
 	while (bf) {
-		if (ctrlbrk) {
+		if (ctrlbrk || host_control::is_cancel_requested()) {
 			ctrlbrk = false;
 			while (bf) delete bf;
 			break;

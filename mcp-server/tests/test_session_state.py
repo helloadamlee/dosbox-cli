@@ -8,7 +8,7 @@ def output_event(text):
     return {"event": "output", "id": "1", "encoding": "base64", "data": data}
 
 
-def result_event(ok=True, errorlevel=0, max_errorlevel=0, drive="C", cwd="C:\\"):
+def result_event(ok=True, errorlevel=0, max_errorlevel=0, drive="C", cwd="C:\\", cancelled=False):
     return {
         "event": "result",
         "id": "1",
@@ -16,6 +16,7 @@ def result_event(ok=True, errorlevel=0, max_errorlevel=0, drive="C", cwd="C:\\")
         "shell_exit": False,
         "errorlevel": errorlevel,
         "max_errorlevel": max_errorlevel,
+        "cancelled": cancelled,
         "drive": drive,
         "cwd": cwd,
         "duration_ms": 1,
@@ -82,6 +83,18 @@ def test_bad_command_marker_detected_in_output():
     state.record_event(output_event('Bad command or filename - "NOPE.EXE"\r\n'))
 
     assert state.snapshot()["bad_command"] is True
+
+
+def test_cancelled_flag_tracked_from_result_and_cleared_on_next_request():
+    state = SessionState()
+    state.record_event({"event": "ready"})
+    state.begin_request()
+    state.record_event(result_event(cancelled=True))
+
+    assert state.snapshot()["cancelled"] is True
+
+    state.begin_request()
+    assert state.snapshot()["cancelled"] is None
 
 
 def test_done_stays_true_until_next_begin_request():

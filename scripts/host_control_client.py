@@ -20,6 +20,22 @@ class WorkflowError(RuntimeError):
     pass
 
 
+class SessionClosed(RuntimeError):
+    """The server ended the host-control session.
+
+    Raised instead of a raw transport OSError so callers see one clear message.
+    The common cause is the DOS shell exiting, which ends the DOSBox-X process.
+    """
+
+    pass
+
+
+SESSION_CLOSED_MESSAGE = (
+    "host control session ended: DOSBox-X closed the connection "
+    "(the DOS shell exited, or the emulator stopped)"
+)
+
+
 @dataclass
 class WorkflowStep:
     action: str
@@ -326,8 +342,23 @@ OPEN_EXISTING = 3
 ERROR_FILE_NOT_FOUND = 2
 ERROR_BROKEN_PIPE = 109
 ERROR_PIPE_BUSY = 231
+ERROR_NO_DATA = 232
+ERROR_PIPE_NOT_CONNECTED = 233
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\"
+
+# Windows reports a closed peer with any of these codes depending on whether the
+# server disconnected its end, exited, or was killed. All three mean the same
+# thing to a client: the host-control session is over.
+WINDOWS_PIPE_DISCONNECT_ERRORS = (
+    ERROR_BROKEN_PIPE,
+    ERROR_NO_DATA,
+    ERROR_PIPE_NOT_CONNECTED,
+)
+
+
+def is_windows_pipe_disconnect(error):
+    return error in WINDOWS_PIPE_DISCONNECT_ERRORS
 
 
 def normalize_windows_pipe_endpoint(endpoint):
@@ -421,7 +452,7 @@ class WindowsPipeApi:
         bytes_read = ctypes.c_uint32()
         if not self.kernel32.ReadFile(handle, buffer, size, ctypes.byref(bytes_read), None):
             error = self.get_last_error()
-            if error == ERROR_BROKEN_PIPE:
+            if is_windows_pipe_disconnect(error):
                 return b""
             raise OSError(error, "ReadFile failed")
         return buffer.raw[: bytes_read.value]
@@ -432,7 +463,7 @@ class WindowsPipeApi:
             handle, None, 0, None, ctypes.byref(available), None
         ):
             error = self.get_last_error()
-            if error == ERROR_BROKEN_PIPE:
+            if is_windows_pipe_disconnect(error):
                 return None
             raise OSError(error, "PeekNamedPipe failed")
         return available.value
@@ -542,11 +573,15 @@ class PipeTransport(BufferedLineTransport):
             try:
                 self.api.write_file(self.handle, line.encode("utf-8") + b"\n")
             except OSError as exc:
-                raise windows_pipe_error(
-                    self.endpoint, "write", windows_error_code(exc)
-                ) from exc
+                error = windows_error_code(exc)
+                if is_windows_pipe_disconnect(error):
+                    raise SessionClosed(SESSION_CLOSED_MESSAGE) from exc
+                raise windows_pipe_error(self.endpoint, "write", error) from exc
             return
-        os.write(self.write_fd, line.encode("utf-8") + b"\n")
+        try:
+            os.write(self.write_fd, line.encode("utf-8") + b"\n")
+        except BrokenPipeError as exc:
+            raise SessionClosed(SESSION_CLOSED_MESSAGE) from exc
 
     def close(self):
         if self.windows_pipe:
@@ -655,7 +690,7 @@ def read_event_line(transport, deadline=None, description="event", recorder=None
 
     raw_line = transport.pop_line()
     if not raw_line:
-        raise RuntimeError("unexpected EOF from host control transport")
+        raise SessionClosed(SESSION_CLOSED_MESSAGE)
     sys.stdout.buffer.write(raw_line)
     sys.stdout.flush()
     try:
@@ -724,6 +759,17 @@ def run_one_shot(
 
 
 def run_repl(transport, timeout=None, allow_input=True):
+    try:
+        return run_repl_loop(transport, timeout=timeout, allow_input=allow_input)
+    except SessionClosed as exc:
+        # Typing "exec exit" ends the DOS shell and the session with it. That is
+        # a normal way to leave the REPL, not a failure.
+        sys.stderr.write(f"{exc}\n")
+        sys.stderr.flush()
+        return 0
+
+
+def run_repl_loop(transport, timeout=None, allow_input=True):
     read_event_line(transport, make_deadline(timeout), "ready event")
     next_request_id = 1
 
@@ -779,6 +825,7 @@ class WorkflowRuntime:
         self.request_ops = {}
         self.completed_requests = {}
         self.pending_events = []
+        self.session_ended = False
 
     def read_event(self, description):
         event = read_event_line(
@@ -791,12 +838,22 @@ class WorkflowRuntime:
         return event
 
     def remember_completion(self, event):
+        if event.get("event") == "result" and event.get("shell_exit"):
+            # The DOS shell exited, so DOSBox-X is tearing the session down.
+            # Report that directly instead of letting the next request fail on
+            # a closed pipe.
+            self.session_ended = True
         request_id = str(event.get("id", ""))
         op = self.request_ops.get(request_id)
         if op is not None and event_completes_request(event, request_id, op):
             self.completed_requests[request_id] = event
 
     def send_request(self, op, command=None, text=None, key=None):
+        if self.session_ended:
+            raise WorkflowError(
+                "the DOS shell exited in an earlier step, so the host-control "
+                "session is closed and no further requests can be sent"
+            )
         request_id = str(self.next_request_id)
         self.next_request_id += 1
         self.request_ops[request_id] = op
@@ -1097,6 +1154,10 @@ def main(argv=None):
         return 1
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
+        return 1
+    except OSError as exc:
+        # Transport faults must not reach the user as a Python traceback.
+        print(f"host control transport failed: {exc}", file=sys.stderr)
         return 1
     finally:
         if not aborted:

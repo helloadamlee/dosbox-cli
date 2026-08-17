@@ -827,9 +827,39 @@ class HostControlLiveTest(unittest.TestCase):
             )
             # The batch body must drain before the shell exits, and the workflow
             # must return promptly instead of hanging on the closing pipe. The
-            # shell_exit result is asserted once the client tolerates the server
-            # closing the pipe after the final result (Task 5).
+            # client tolerates the server closing the pipe after that final
+            # result, so the workflow succeeds rather than reporting a
+            # transport fault.
             self.assertTrue((root / "BYE.TXT").exists(), result.diagnostics())
+            self.assertEqual(result.proc.returncode, 0, result.diagnostics())
+            shell_exit_results = [
+                event
+                for event in result.events
+                if event.get("event") == "result" and event.get("shell_exit")
+            ]
+            self.assertEqual(len(shell_exit_results), 1, result.diagnostics())
+            self.assertTrue(shell_exit_results[0].get("ok"), result.diagnostics())
+
+    def test_pipe_workflow_step_after_shell_exit_reports_closed_session(self):
+        # A step queued after the shell exits must fail with a readable
+        # diagnostic instead of a raw Windows pipe error.
+        with tempfile.TemporaryDirectory(prefix="dosbox-x-exit-after-") as temp:
+            root = Path(temp)
+            (root / "QUIT.BAT").write_text("@echo bye>BYE.TXT\r\n@exit\r\n", encoding="ascii")
+            result = self.run_pipe_workflow(
+                {
+                    "steps": [
+                        {"exec": f'mount c "{root}"'},
+                        {"exec": "c:"},
+                        {"exec": "QUIT.BAT"},
+                        {"status": True},
+                    ]
+                },
+                timeout_seconds=20,
+            )
+            self.assertNotEqual(result.proc.returncode, 0, result.diagnostics())
+            self.assertIn("DOS shell exited", result.proc.stderr, result.diagnostics())
+            self.assertNotIn("Traceback", result.proc.stderr, result.diagnostics())
 
     def test_pipe_high_volume_output_is_byte_exact(self):
         payload = b"0123456789ABCDEF\r\n" * 700_000

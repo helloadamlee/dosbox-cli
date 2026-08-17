@@ -68,6 +68,34 @@ user and LocalSystem. Each process accepts one controller and does not
 reconnect. Inbound NDJSON request lines are limited to 1 MiB. Client timeouts
 close the client endpoint; they do not cancel a DOS program already running.
 
+## The session starts at a bare prompt
+
+Host control replaces the DOS shell's normal run loop, which is what executes
+`AUTOEXEC.BAT`. **The `[autoexec]` section of a config file therefore never runs
+under `-control-stdio`, `-control-socket`, or `-control-pipe`.** The session
+begins at a bare `Z:\` prompt no matter what the config says.
+
+Every other section of the config still applies, so a config that sets
+`[cpu] core`, `[dos] xms/ems/umb`, or `memsize` works normally. Only the
+`[autoexec]` commands are skipped.
+
+This matters when porting a working `-conf whatever.conf` setup to host control:
+a config whose `[autoexec]` mounts a drive and sets `PATH` and `TEMP` silently
+loses all of it, and the build then fails in confusing ways. Reissue those
+commands as `exec` requests, or as the first steps of a workflow recipe:
+
+```json
+{
+  "steps": [
+    {"exec": "mount c /path/to/project"},
+    {"exec": "c:"},
+    {"exec": "path Z:\\;C:\\;C:\\TOOLS"},
+    {"exec": "set TEMP=C:\\"},
+    {"exec": "set TMP=C:\\"}
+  ]
+}
+```
+
 ## Requests
 
 Every request is one JSON object followed by a newline.
@@ -121,8 +149,20 @@ Command output is emitted as raw DOS console bytes encoded with base64:
 Completed `exec` requests emit `result`:
 
 ```json
-{"event":"result","id":"1","ok":true,"shell_exit":false,"errorlevel":0,"drive":"Z","cwd":"Z:\\","duration_ms":1}
+{"event":"result","id":"1","ok":true,"shell_exit":false,"errorlevel":0,"max_errorlevel":0,"drive":"Z","cwd":"Z:\\","duration_ms":1}
 ```
+
+`errorlevel` is the exit status of the last DOS program the request ran.
+`max_errorlevel` is the highest exit status seen during the request. They differ
+for batch files: a batch whose middle step fails and whose last step succeeds
+reports `errorlevel` `0` and a nonzero `max_errorlevel`. Automation that runs
+build batches should inspect `max_errorlevel` to catch a failure that a later
+successful command would otherwise mask.
+
+`shell_exit` is `true` when the request ended the DOS shell, which also ends the
+DOSBox-X process and therefore the host-control session. A batch file whose last
+line is `exit` does this. It is the final event of the session: no further
+request will be answered.
 
 Completed `status` requests emit `status`:
 
@@ -161,6 +201,32 @@ or an object-form workflow step when a nonzero code is expected:
 ```json
 {"exec":{"command":"EXIT7.COM","expect_errorlevel":[0,7]}}
 ```
+
+A command DOS cannot find is **not** reported as a failure. DOS writes
+`Bad command or filename - "NOSUCHPROGRAM.EXE"` to the console and leaves the
+errorlevel alone, so the request completes with `"ok":true` and `errorlevel` 0,
+and the reference client exits 0. A misspelled or missing build tool therefore
+looks like a successful step. Until this is reported as a distinct condition,
+automation that must not silently pass should scan the `output` events for
+`Bad command or filename`, or verify the build's expected artifacts afterward.
+
+`expect_errorlevel` checks `result.errorlevel` only. It does not check
+`result.max_errorlevel`, so a batch file that fails midway and then ends on a
+successful command still passes. Read `max_errorlevel` from the event stream or
+the transcript when that distinction matters.
+
+## Session end
+
+A host-control session ends when the DOS shell exits, which ends the DOSBox-X
+process. The final `result` carries `"shell_exit":true`, after which the server
+closes the pipe or socket.
+
+This is a normal outcome, not a transport fault. A workflow whose last step ends
+the shell succeeds and exits `0`. A workflow that has further steps queued after
+the shell exits fails with a `the DOS shell exited in an earlier step` message
+and exits nonzero. Reading past the end of a session raises a single
+`host control session ended` message rather than a platform pipe error, so a
+`build.bat` that ends in `exit` is a supported recipe.
 
 REPL reports nonzero codes on stderr but remains connected.
 
