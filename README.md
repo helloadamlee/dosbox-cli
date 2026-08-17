@@ -17,9 +17,19 @@ DOSBox-X referenced this capability but never finished it. This fork implements 
 | Named pipe | Unix-like (FIFO) | ✅ Working |
 | Named pipe | Windows | ✅ Working — see [`docs/host-control.md`](docs/host-control.md) |
 
+## MCP server
+
+For agentic use, [`mcp-server/`](mcp-server/) packages the protocol as six
+typed MCP tools — `start_session`, `exec`, `poll`, `send_input`, `cancel`,
+`stop_session` — instead of hand-rolled NDJSON. It's async-with-polling, so
+no tool call blocks on a running DOS command. See
+[`mcp-server/README.md`](mcp-server/README.md) for install and the full tool
+table.
+
 ## Quick start
 
-Start DOSBox-X with one of the host-control transports:
+Start DOSBox-X with one of the host-control transports directly, if you'd
+rather talk to the raw protocol than use the MCP server above:
 
 ```bash
 # stdio: requests on stdin, events on stdout
@@ -48,10 +58,8 @@ Receive events back, e.g.:
 
 A reference Python client is included at [`scripts/host_control_client.py`](scripts/host_control_client.py).
 
-Windows named-pipe automation, workflow recipes, failure semantics, and
-limitations are documented in [docs/host-control.md](docs/host-control.md).
-
-Full protocol reference: [`docs/host-control.md`](docs/host-control.md).
+Full protocol reference — transports, workflow recipes, failure semantics,
+and known limitations — lives in [`docs/host-control.md`](docs/host-control.md).
 
 ## Why
 
