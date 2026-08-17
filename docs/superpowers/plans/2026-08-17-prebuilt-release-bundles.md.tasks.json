@@ -81,7 +81,7 @@
     {
       "id": 10,
       "subject": "Task 11: Tag and publish v0.1.0",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         9
       ],
