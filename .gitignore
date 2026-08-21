@@ -144,8 +144,10 @@ contrib/macos/dosbox-x.plist
 
 # local linked worktrees used for feature isolation
 /.worktrees/
-/.codex/cocoindex-venv/
+/.codex/
 /.cocoindex_code/
+/.cocoindex_code-docker/
+/.codegraph/
 
 # Host-control release-gate and test artifacts
 /artifact-provenance.json
