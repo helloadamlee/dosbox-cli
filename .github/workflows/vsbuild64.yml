@@ -147,7 +147,7 @@ jobs:
       - uses: microsoft/setup-msbuild@v3
       - name: Check host control changes
         id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         with:
           filters: |
             host-control:
