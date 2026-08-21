@@ -33,14 +33,43 @@ sudo apt-get install -y libsdl2-2.0-0 libsdl2-net-2.0-0 libasound2t64 \
     libncurses6 libpcap0.8 libslirp0 libfluidsynth3 libgl1 libpng16-16t64
 ```
 
-Those names are current for Ubuntu 24.04+ and Debian 13+. For non-Debian
-distros, install the equivalent SDL2, SDL2_net, ALSA, ncurses, libpcap,
-libslirp, FluidSynth, OpenGL (libGL) and libpng runtime packages.
+Those names are current for Ubuntu 24.04+ and Debian 13+.
 
 `libgl1` and `libpng16-16t64` are easy to miss: the emulator links both
 directly, but nothing else in this list depends on them, so only a minimal
 system notices they are absent. `scripts/check_runtime_deps.py` verifies this
 list covers every linked library on each release build.
+
+**Fedora, and other non-Debian distros.** Tested on Fedora 43. Install the
+equivalents:
+
+```bash
+sudo dnf install -y SDL2 SDL2_net alsa-lib ncurses-libs libpcap libslirp fluidsynth-libs mesa-libGL libpng libXrandr
+```
+
+Two things there do not follow from translating the Debian list package by
+package:
+
+- `libXrandr` has to be named explicitly. Ubuntu's SDL2 package depends on it
+  so it arrives on its own there; Fedora's SDL2 does not require it.
+- `libpcap` alone is not enough. Debian and Ubuntu ship libpcap under its
+  historical soname `libpcap.so.0.8`, Fedora ships the upstream
+  `libpcap.so.1`, and no Fedora package provides the Debian name — so the
+  emulator does not start at all, failing with `libpcap.so.0.8: cannot open
+  shared object file`. Both distros ship the same upstream 1.10.x release, so
+  a compatibility symlink is sound:
+
+  ```bash
+  sudo ln -sf /usr/lib64/libpcap.so.1 /usr/lib64/libpcap.so.0.8
+  sudo ldconfig
+  ```
+
+With those in place the emulator runs a real DOS command on a clean Fedora.
+`scripts/smoke_bundle_fedora.sh` in the repository reproduces the whole check.
+
+You may also see `no version information available` warnings naming
+libncurses or libtinfo. Debian builds ncurses with versioned symbols and
+Fedora does not; the warnings are harmless.
 
 If the emulator fails to start, run `ldd dosbox-x/dosbox-x` and look for
 `not found` — that names the missing package directly. Windows needs none of
