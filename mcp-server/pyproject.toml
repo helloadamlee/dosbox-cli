@@ -1,17 +1,16 @@
 [project]
 name = "dosbox-x-mcp"
-version = "0.1.1"
+version = "0.2.0"
 description = "MCP server wrapping DOSBox-X host-control for agentic DOS automation"
-# 3.10, not 3.9: every mcp release in the range below (1.2.0 through 2.0.0)
-# declares Requires-Python >=3.10, so a 3.9 install fails to resolve mcp at
-# all. The floor is set by the dependency, not by our own syntax use.
+# 3.10, not 3.9: mcp 2.0 declares Requires-Python >=3.10, so a 3.9 install
+# fails to resolve mcp at all. The floor is set by the dependency, not by our
+# own syntax use.
 requires-python = ">=3.10"
-# mcp 2.0 removed mcp.server.fastmcp (the FastMCP entry point server.py is
-# built on) in favour of mcp.server.mcpserver. Until server.py is ported,
-# an uncapped ">=1.2.0" resolves to 2.x and the dosbox-mcp console script
-# dies on import. Lift the cap only together with that port.
+# Floor of 2, not >=1.2.0: server.py builds on mcp.server.mcpserver, which
+# exists only from 2.0 onwards. The 1.x line has mcp.server.fastmcp instead,
+# so an install that resolved 1.x would die on import.
 dependencies = [
-    "mcp>=1.2.0,<2",
+    "mcp>=2,<3",
 ]
 
 [project.optional-dependencies]
