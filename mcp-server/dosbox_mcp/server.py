@@ -1,12 +1,12 @@
-"""FastMCP server exposing DOSBox-X host control as agent tools."""
+"""MCP server exposing DOSBox-X host control as agent tools."""
 
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from .session import DosboxSession, SessionError
 
-mcp = FastMCP("dosbox-x")
+mcp = MCPServer("dosbox-x")
 
 _session: Optional[DosboxSession] = None
 

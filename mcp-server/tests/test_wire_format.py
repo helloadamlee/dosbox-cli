@@ -1,28 +1,36 @@
 """Wire-format tests: the MCP protocol surface as a client actually sees it.
 
 test_server.py calls the tool functions as plain Python, so it cannot observe
-anything the MCP layer does — a renamed tool, a dropped schema field, or a
-changed result serialization all pass it. These tests drive a real ClientSession
-over the SDK's in-memory transport instead, so those failures are visible.
+anything the MCP layer does -- a renamed tool, a dropped schema field, or a
+changed result serialization all pass it. These tests drive a real client over
+the SDK's in-memory transport instead, so those failures are visible.
 
-SDK surface as found in the installed version (mcp 1.28.1), recorded here
-because the mcp 2.0 port needs to know which of these names survived:
+Requires mcp 2.x. server.py imports mcp.server.mcpserver, which does not exist
+in the 1.x line, so there is no version of this suite that runs against both.
 
-  * mcp.shared.memory.create_connected_server_and_client_session(server) --
-    an async context manager yielding a connected ClientSession. Accepts a
-    FastMCP instance directly, so no subprocess and no socket.
-  * FastMCP exposes: tool, add_tool, remove_tool, list_tools, call_tool, run,
-    run_stdio_async, run_sse_async, run_streamable_http_async.
+SDK surface as found in mcp 2.0.0, recorded because it differs from 1.x in two
+ways that matter to anyone reading these assertions:
+
+  * mcp.shared.memory.create_connected_server_and_client_session, the 1.x
+    in-memory helper, is gone. The replacement is the public mcp.client.Client,
+    which takes a Server or MCPServer instance directly and is documented for
+    exactly this use. (mcp.client._memory.InMemoryTransport is what backs it,
+    but it is private.)
+  * The result and tool models renamed their camelCase fields to snake_case:
+    inputSchema -> input_schema, outputSchema -> output_schema, isError ->
+    is_error, structuredContent -> structured_content. This is a rename of the
+    Python attributes only; the values are unchanged.
 
 Two observed conventions are pinned deliberately, because a silent change to
-either is exactly what this file exists to catch:
+either is exactly what this file exists to catch. Both were verified to be
+identical either side of the 1.28.1 -> 2.0.0 port:
 
-  * No tool declares an outputSchema, so every result arrives as a single
-    JSON-encoded TextContent block and structuredContent is None. The tools are
-    annotated `-> dict` (bare, unparameterized), which FastMCP treats as
-    unstructured. If a port starts emitting structuredContent, these tests fail
-    -- that is the intended signal, not a defect in the tests.
-  * A SessionError raised inside a tool surfaces as a result with isError set,
+  * No tool declares an output_schema, so every result arrives as a single
+    JSON-encoded TextContent block and structured_content is None. The tools
+    are annotated `-> dict` (bare, unparameterized), which the SDK treats as
+    unstructured. If a later version starts emitting structured_content, these
+    tests fail -- that is the intended signal, not a defect in the tests.
+  * A SessionError raised inside a tool surfaces as a result with is_error set,
     not as an exception on the client. The client call returns normally.
 """
 
@@ -30,7 +38,7 @@ import json
 
 import anyio
 import pytest
-from mcp.shared.memory import create_connected_server_and_client_session
+from mcp.client import Client
 
 from dosbox_mcp import server
 
@@ -55,7 +63,7 @@ def drive(body):
     """Run `body(session)` against a real in-memory MCP client session."""
 
     async def _main():
-        async with create_connected_server_and_client_session(server.mcp) as session:
+        async with Client(server.mcp) as session:
             await body(session)
 
     anyio.run(_main)
@@ -63,9 +71,9 @@ def drive(body):
 
 def payload(result):
     """Return a tool result's JSON body, asserting how it was serialized."""
-    assert result.isError is False, f"unexpected tool error: {result.content}"
-    assert result.structuredContent is None, (
-        "structuredContent appeared; the result serialization changed"
+    assert result.is_error is False, f"unexpected tool error: {result.content}"
+    assert result.structured_content is None, (
+        "structured_content appeared; the result serialization changed"
     )
     assert len(result.content) == 1, f"expected one content block, got {result.content}"
     assert result.content[0].type == "text"
@@ -102,7 +110,7 @@ def test_input_schemas_pin_required_params():
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
         assert set(tools) == set(expected)
         for name, (required, properties) in expected.items():
-            schema = tools[name].inputSchema
+            schema = tools[name].input_schema
             assert schema.get("required") == required, f"{name}: required changed"
             assert sorted(schema.get("properties", {})) == properties, (
                 f"{name}: properties changed"
@@ -183,7 +191,7 @@ def test_no_session_surfaces_as_tool_error():
         # raised on the client. Which of the two a port produces is a plausible
         # 2.0 change, so the convention is pinned rather than assumed.
         result = await session.call_tool("exec", {"command": "dir"})
-        assert result.isError is True
+        assert result.is_error is True
         assert result.content[0].type == "text"
         assert "no active session" in result.content[0].text
 
@@ -196,7 +204,7 @@ def test_results_are_json_text_not_structured_content():
     async def body(session):
         for name, args in (("status", {}), ("cancel", {}), ("send_input", {"text": "y"})):
             result = await session.call_tool(name, args)
-            assert result.structuredContent is None, f"{name}: now structured"
+            assert result.structured_content is None, f"{name}: now structured"
             assert len(result.content) == 1, f"{name}: content block count changed"
             assert result.content[0].type == "text", f"{name}: not a text block"
             # Must be a JSON object, not a repr or a bare string.
