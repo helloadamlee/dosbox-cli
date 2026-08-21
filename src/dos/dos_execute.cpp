@@ -21,6 +21,7 @@
 #include <ctype.h>
 
 #include "dosbox.h"
+#include "host_control.h"
 #include "logging.h"
 #include "mem.h"
 #include "dos_inc.h"
@@ -111,6 +112,7 @@ void DOS_UpdatePSPName(void) {
 void DOS_Terminate(uint16_t pspseg,bool tsr,uint8_t exitcode) {
 
 	dos.return_code=exitcode;
+	host_control::track_dos_errorlevel(exitcode);
 	dos.return_mode=tsr?(uint8_t)RETURN_TSR:(uint8_t)RETURN_EXIT;
 	
 	DOS_PSP curpsp(pspseg);

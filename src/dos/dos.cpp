@@ -979,6 +979,7 @@ void HostAppRun() {
                     }
                 }
                 dos.return_code = exitCode&255;
+                host_control::track_dos_errorlevel(dos.return_code);
                 dos.return_mode = 0;
                 hret = 0;
             } else if (hret > 0)

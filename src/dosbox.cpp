@@ -468,6 +468,7 @@ static Bitu Normal_Loop(void) {
     try {
         while (1) {
             (void)host_control::drain_queued_input();
+            host_control::flush_buffered_output_if_due();
             if (PIC_RunQueue()) {
                 /* now is the time to check for the NMI (Non-maskable interrupt) */
                 CPU_Check_NMI();

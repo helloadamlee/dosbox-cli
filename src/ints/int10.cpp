@@ -209,6 +209,7 @@ Bitu INT10_Handler(void) {
 			INT10_TeletypeOutput(reg_al, attr >> 8);
 		} else
 			INT10_TeletypeOutput(reg_al,reg_bl);
+		host_control::capture_tty_output(reg_al);
 		break;
 	case 0x0F:								/* Get videomode */
 		reg_bh=real_readb(BIOSMEM_SEG,BIOSMEM_CURRENT_PAGE);

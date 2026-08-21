@@ -862,7 +862,13 @@ bool DOS_WriteFile(uint16_t entry,const uint8_t * data,uint16_t * amount,bool fc
 	}
 */
 	uint16_t towrite=*amount;
+	/* Suppress the INT 10h teletype capture while the CON device drives the
+	 * console, since this write will be captured as a whole below. */
+	const bool capturing_console =
+	        host_control::should_capture_dos_write(Files[handle]->GetInformation(), Files[handle]->GetName());
+	host_control::set_console_device_capture(capturing_console);
 	bool ret=Files[handle]->Write(data,&towrite);
+	host_control::set_console_device_capture(false);
 	*amount=towrite;
 	if (towrite != 0) {
 		host_control::capture_dos_write(
