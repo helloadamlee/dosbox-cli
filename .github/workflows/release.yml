@@ -136,6 +136,13 @@ jobs:
             exit 1
           fi
 
+      # The FFmpeg grep above catches one specific regression. This catches the
+      # general case: any library the emulator links that no package named in
+      # QUICKSTART.md accounts for. Without it a new runtime dependency reaches
+      # users as "the binary will not start" instead of as a failed build here.
+      - name: Check runtime library coverage
+        run: ldd src/dosbox-x | python3 scripts/check_runtime_deps.py
+
       - name: Stage emulator payload
         run: |
           top=`pwd`

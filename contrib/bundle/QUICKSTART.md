@@ -30,12 +30,17 @@ minimal or freshly installed system needs these before it will start:
 
 ```bash
 sudo apt-get install -y libsdl2-2.0-0 libsdl2-net-2.0-0 libasound2t64 \
-    libncurses6 libpcap0.8 libslirp0 libfluidsynth3
+    libncurses6 libpcap0.8 libslirp0 libfluidsynth3 libgl1 libpng16-16t64
 ```
 
 Those names are current for Ubuntu 24.04+ and Debian 13+. For non-Debian
 distros, install the equivalent SDL2, SDL2_net, ALSA, ncurses, libpcap,
-libslirp and FluidSynth runtime packages.
+libslirp, FluidSynth, OpenGL (libGL) and libpng runtime packages.
+
+`libgl1` and `libpng16-16t64` are easy to miss: the emulator links both
+directly, but nothing else in this list depends on them, so only a minimal
+system notices they are absent. `scripts/check_runtime_deps.py` verifies this
+list covers every linked library on each release build.
 
 If the emulator fails to start, run `ldd dosbox-x/dosbox-x` and look for
 `not found` — that names the missing package directly. Windows needs none of
