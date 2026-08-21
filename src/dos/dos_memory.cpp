@@ -103,12 +103,18 @@ void DOS_CompressMemory(uint16_t first_segment=0/*default*/,uint32_t healfrom=0x
 			 * to their EXE resident size they put the stack or other data in the way of the next MCB free
 			 * block header. Real MS-DOS appears in this case to just scan up to the last valid block and
 			 * then right after it, write a new free MCB block there. We can't do this for the split memory
-			 * layout of the PCjr emulation. */
-			if (auto_repair_dos_psp_mcb_corruption && nseg >= healfrom && (nseg+1u) < CONV_MAX_SEG && !(machine==MCH_PCJR)) {
+			 * layout of the PCjr emulation.
+			 *
+			 * The conventional memory top is read from the BIOS memory size
+			 * (0x40:0x13) rather than the static CONV_MAX_SEG so the repair also
+			 * works when utilities like QEMM's VIDRAM remap the video framebuffer
+			 * to extend conventional memory past 640KB (segments 0xA000-0xB7FF). */
+			const uint16_t conv_top = (uint16_t)(mem_readw(BIOS_MEMORY_SIZE) << (10u - 4u));
+			if (auto_repair_dos_psp_mcb_corruption && nseg >= healfrom && (nseg+1u) < conv_top && !(machine==MCH_PCJR)) {
 				LOG(LOG_DOSMISC,LOG_ERROR)("Corrupted MCB chain, but within the possible memory region of the DOS application.");
 				DOS_Mem_MCBdump();
 				LOG(LOG_DOSMISC,LOG_ERROR)("Declaring all memory past it as a free block. This is apparently MS-DOS behavior.");
-				mcb_next.SetSize(CONV_MAX_SEG - (nseg + 1u));
+				mcb_next.SetSize(conv_top - (nseg + 1u));
 				mcb_next.SetPSPSeg(MCB_FREE);
 				mcb_next.SetType('Z');
 			}
@@ -137,7 +143,30 @@ void DOS_FreeProcessMemory(uint16_t pspseg) {
 			mcb.SetPSPSeg(MCB_FREE);
 		}
 		if (mcb.GetType()==0x5a) break;
-		if (GCC_UNLIKELY(mcb.GetType()!=0x4d)) DOS_Mem_E_Exit("Corrupt MCB chain");
+		if (GCC_UNLIKELY(mcb.GetType()!=0x4d)) {
+			/* Some programs corrupt the trailing MCB header byte. Real MS-DOS
+			 * recovers by declaring the corrupted block and everything after it
+			 * as a single free terminal block. Mirror DOS_CompressMemory()'s
+			 * auto-repair path instead of halting the emulator.
+			 *
+			 * The conventional memory top is read from the BIOS memory size
+			 * (0x40:0x13) rather than the static CONV_MAX_SEG so the repair also
+			 * works when utilities like QEMM's VIDRAM remap the video framebuffer
+			 * to extend conventional memory past 640KB (segments 0xA000-0xB7FF). */
+			const uint16_t conv_top = (uint16_t)(mem_readw(BIOS_MEMORY_SIZE) << (10u - 4u));
+			if (auto_repair_dos_psp_mcb_corruption && (mcb_segment+1u) < conv_top && !(machine==MCH_PCJR)) {
+				LOG(LOG_DOSMISC,LOG_ERROR)("Corrupted MCB chain detected during process cleanup.");
+				DOS_Mem_MCBdump();
+				LOG(LOG_DOSMISC,LOG_ERROR)("Declaring all memory past it as a free block. This is apparently MS-DOS behavior.");
+				mcb.SetSize(conv_top - (mcb_segment + 1u));
+				mcb.SetPSPSeg(MCB_FREE);
+				mcb.SetType('Z');
+			}
+			else {
+				DOS_Mem_E_Exit("Corrupt MCB chain");
+			}
+			break;
+		}
 		mcb_segment+=mcb.GetSize()+1;
 		mcb.SetPt(mcb_segment);
 	}
