@@ -55,7 +55,12 @@ The package list itself is no longer taking anyone's word for it.
 the emulator links anything `QUICKSTART.md` doesn't account for, against a
 committed soname → package mapping. Writing it turned up two libraries the
 list had been missing all along (`libgl1`, `libpng16-16t64`); both are
-present on any desktop system, which is why nobody hit it.
+present on any desktop system, which is why nobody hit it. Confirmed live on
+a real Ubuntu 24.04 install: `libgl1` is missing outright with just the
+original seven, and `libpng16-16t64` only survives by accident — it rides in
+as a `Recommends` of something else the seven pull in, which is absent on
+any system installed with `--no-install-recommends` (most minimal container
+images).
 
 ## Two things left out on purpose, not by accident
 
