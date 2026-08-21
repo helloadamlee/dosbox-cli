@@ -1,6 +1,6 @@
 echo off
 cd dosbox-x
-bash autogen.sh
+bash scripts/autogen.sh
 dash configure --enable-sdl2 --disable-gamelink
 REM since cpu cores need a lot of memory,
 REM we don't want to build parallel
