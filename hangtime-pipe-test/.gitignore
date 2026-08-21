@@ -1,0 +1,5 @@
+# Run artifacts from driving the build -- regenerated every run, no value
+# committed. The recipes and the driver are tracked; their output is not.
+*.log
+*.txt
+*.jsonl

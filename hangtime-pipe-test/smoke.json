@@ -1,0 +1,9 @@
+{
+  "steps": [
+    {"comment": "Mount the Hangtime build dir and list it"},
+    {"exec": "mount c \"C:\\Projects\\hangtime\\Asure\\nba-hangtime-rebuild-main\\BACKUP\\XCODE101L\""},
+    {"exec": "c:"},
+    {"exec": "dir"},
+    {"status": true}
+  ]
+}

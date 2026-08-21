@@ -1,0 +1,9 @@
+{
+  "steps": [
+    {"comment": "Mount Hangtime build dir and run graphics build (loadw)"},
+    {"exec": "mount c \"C:\\Projects\\hangtime\\Asure\\nba-hangtime-rebuild-main\\BACKUP\\XCODE101L\""},
+    {"exec": "c:"},
+    {"exec": "path Z:\\;C:\\;C:\\tools"},
+    {"exec": "buildgfx.bat"}
+  ]
+}
