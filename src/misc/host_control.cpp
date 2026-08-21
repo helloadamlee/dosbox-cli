@@ -56,7 +56,14 @@ BufferedOutput buffered_output = {};
 WriteLineFn active_write_line = {};
 std::deque<PendingInputCode> pending_input_codes = {};
 uint64_t next_pending_input_sequence = 0;
+// HX_DOS's single-threaded cross-toolchain does not implement std::mutex (its
+// libstdc++ was built without gthreads, so <mutex>'s contents -- including
+// std::lock_guard -- are unavailable). No real concurrent producer exists on
+// that target anyway, so the four functions using this guard their access
+// with a plain #ifndef HX_DOS instead of relying on any <mutex> type.
+#ifndef HX_DOS
 std::mutex pending_input_mutex = {};
+#endif
 std::atomic<bool> exec_in_progress = {false};
 std::atomic<bool> cancel_requested = {false};
 bool console_device_capture_active = false;
@@ -163,6 +170,15 @@ bool request_cancel()
 	return true;
 }
 
+// DuplexSessionState and the functions below back run_control_duplex_session,
+// which spawns a reader thread. Not available under HX_DOS: no gthreads
+// support for std::thread/std::mutex/std::condition_variable, and no
+// meaningful separate "host" for a duplex session to exist with in the first
+// place, since HX_DOS is DOSBox-X running natively on DOS via the HX
+// extender. run_control_duplex_session gets a matching #ifndef HX_DOS guard
+// below with a stub matching the existing style used for
+// run_control_socket_session on non-Unix platforms.
+#ifndef HX_DOS
 struct DuplexSessionState {
 	std::mutex mutex = {};
 	std::condition_variable condition = {};
@@ -267,6 +283,7 @@ bool is_duplex_session_disconnected(DuplexSessionState &state,
 	}
 	return peer_disconnected && peer_disconnected();
 }
+#endif // !HX_DOS
 
 #if defined(__unix__) || defined(__APPLE__)
 std::string make_errno_message(const char *action, const std::string &path = {})
@@ -658,7 +675,12 @@ bool append_line_bytes(LineAccumulator &state,
 	return true;
 }
 
-#if defined(_WIN32) || defined(WIN32)
+// !defined(HX_DOS): HX_DOS's toolchain defines _WIN32 but ships older Win32
+// headers lacking CancelIoEx, SDDL_REVISION_1 and
+// ConvertStringSecurityDescriptorToSecurityDescriptorW, all used below. There
+// is also no meaningful named-pipe host for an HX_DOS build to connect to.
+// Falls through to the existing !unix/!Apple stub branches further down.
+#if (defined(_WIN32) || defined(WIN32)) && !defined(HX_DOS)
 namespace {
 
 std::string make_win32_message(const char *action, const std::string &endpoint,
@@ -1273,6 +1295,17 @@ SessionResult run_control_duplex_session(const Options &options,
                                          const ExecRequestFn &exec_request)
 {
 	SessionResult result = {};
+
+#ifdef HX_DOS
+	(void)options;
+	(void)read_line;
+	(void)write_line;
+	(void)peer_disconnected;
+	(void)stop_reader;
+	(void)exec_request;
+	result.had_io_error = true;
+	return result;
+#else
 	DuplexSessionState state = {};
 	state.write_line = write_line;
 
@@ -1409,6 +1442,7 @@ SessionResult run_control_duplex_session(const Options &options,
 
 	reset_session_state();
 	return result;
+#endif // HX_DOS
 }
 
 SessionResult run_control_socket_session(const Options &options,
@@ -1659,7 +1693,7 @@ bool run_pipe_shell()
 		return false;
 	}
 
-#if defined(_WIN32) || defined(WIN32)
+#if (defined(_WIN32) || defined(WIN32)) && !defined(HX_DOS)
 	PipeServer server{};
 	std::string error = {};
 	if (!open_pipe_server(control->opt_host_control.endpoint, server, error)) {
@@ -1772,7 +1806,7 @@ bool open_pipe_server(const std::string &path, PipeServer &server, std::string &
 	reset_pipe_server(server);
 	error.clear();
 
-#if defined(_WIN32) || defined(WIN32)
+#if (defined(_WIN32) || defined(WIN32)) && !defined(HX_DOS)
 	if (path.empty()) {
 		error = "host control pipe path is empty";
 		return false;
@@ -1872,7 +1906,7 @@ bool open_pipe_server(const std::string &path, PipeServer &server, std::string &
 
 void close_pipe_server(PipeServer &server)
 {
-#if defined(_WIN32) || defined(WIN32)
+#if (defined(_WIN32) || defined(WIN32)) && !defined(HX_DOS)
 	server.stop_requested.store(true);
 	if (server.native_handle != 0) {
 		const auto handle = pipe_server_handle(server);
@@ -2079,10 +2113,16 @@ bool build_input_codes_for_key(const std::string &key,
 	return true;
 }
 
+// pending_input_mutex only exists when !defined(HX_DOS) (see its declaration
+// above); the HX_DOS branch of each function below relies on there being no
+// concurrent producer/consumer on that single-threaded target instead.
+
 InputQueueResult queue_input_codes(const std::vector<uint16_t> &codes)
 {
 	InputQueueResult result = {};
+#ifndef HX_DOS
 	std::lock_guard<std::mutex> lock(pending_input_mutex);
+#endif
 
 	if (pending_input_codes.size() + codes.size() > input_queue_max_codes) {
 		result.error = "input queue full";
@@ -2100,7 +2140,9 @@ InputQueueResult queue_input_codes(const std::vector<uint16_t> &codes)
 
 void clear_queued_input()
 {
+#ifndef HX_DOS
 	std::lock_guard<std::mutex> lock(pending_input_mutex);
+#endif
 	pending_input_codes.clear();
 }
 
@@ -2112,7 +2154,9 @@ std::size_t drain_queued_input()
 		uint64_t sequence = 0;
 		uint16_t code = 0;
 		{
+#ifndef HX_DOS
 			std::lock_guard<std::mutex> lock(pending_input_mutex);
+#endif
 			if (pending_input_codes.empty()) {
 				return drained;
 			}
@@ -2125,7 +2169,9 @@ std::size_t drain_queued_input()
 		}
 
 		{
+#ifndef HX_DOS
 			std::lock_guard<std::mutex> lock(pending_input_mutex);
+#endif
 			if (!pending_input_codes.empty() && pending_input_codes.front().sequence == sequence) {
 				pending_input_codes.pop_front();
 			}
@@ -2136,7 +2182,9 @@ std::size_t drain_queued_input()
 
 std::size_t drain_queued_input_codes_for_test(std::vector<uint16_t> &codes, const std::size_t max_codes)
 {
+#ifndef HX_DOS
 	std::lock_guard<std::mutex> lock(pending_input_mutex);
+#endif
 	std::size_t drained = 0;
 	while (drained < max_codes && !pending_input_codes.empty()) {
 		codes.push_back(pending_input_codes.front().code);
