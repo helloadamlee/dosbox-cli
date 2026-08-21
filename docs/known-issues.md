@@ -9,55 +9,53 @@ the ROM/VIDRAM MCB defect, a windowed-focus stall that's still
 unreproduced), see [`host-control-windows-pipe-roadmap.md`](host-control-windows-pipe-roadmap.md)
 instead — this doc is just the release-bundle side of things.
 
-## A handful of build scripts still point at the old paths
+## macOS app bundling still points at the old path
 
-When the repo got reorganized (`3fb7ef870`), a pile of root-level scripts
-moved into `build-scripts/`, `scripts/`, and `docs/`. Two of the leftover
-references broke the actual Windows/Linux release build and are fixed now.
-Four more are still broken, but none of them sit in the release path, so
-they've been low priority:
+`Makefile.am:45` calls `./appbundledeps.py` instead of
+`scripts/appbundledeps.py`, left over from the `3fb7ef870` reorg. It's the
+last of that batch still broken.
 
-- `Makefile.am` still points `EXTRA_DIST` at `autogen.sh` instead of
-  `scripts/autogen.sh` — breaks `make dist`, not CI.
-- `Makefile.am` also calls `./appbundledeps.py` instead of
-  `scripts/appbundledeps.py` — only matters for macOS app bundling, which
-  isn't part of this project right now anyway.
-- `hxdos.yml` calls `build-mingw-hx-dos` without the `build-scripts/`
-  prefix.
-- Both OS/2 build scripts (`build-os2-sdl2.cmd`, `build-debug-os2-sdl2.cmd`)
-  still `bash autogen.sh` instead of `bash scripts/autogen.sh`.
+It stays broken on purpose. It sits inside the `if MACOSX` block, and there
+is no macOS anything in this project — no build job, no machine, no way to
+exercise a fix. A blind one-line edit that nobody can run isn't better than
+a visibly broken path. If it's ever wanted it's exactly that one line.
 
-Same one-line fix as the two that already got patched. Just hasn't been
-worth a CI run for build targets nobody's using yet.
+## The Linux bundle needs a symlink on non-Debian distros
 
-## The MCP server is pinned below mcp 2.0
+`libpcap` is the sticking point, and no package fixes it. Debian and Ubuntu
+ship libpcap under its historical soname `libpcap.so.0.8`; everyone else
+follows upstream and ships `libpcap.so.1`. Nothing on Fedora provides the
+Debian name, so the emulator doesn't start at all — it dies in the loader
+before any of our code runs:
 
-`mcp-server/pyproject.toml` caps the `mcp` dependency at `<2` because
-`server.py` is built on `mcp.server.fastmcp.FastMCP`, which got removed in
-2.0 in favor of `mcp.server.mcpserver.MCPServer`.
+```
+error while loading shared libraries: libpcap.so.0.8:
+cannot open shared object file: No such file or directory
+```
 
-The good news: the actual rename is trivial. I tried it in a throwaway
-venv against mcp 2.0.0 and all seven tools registered and worked fine.
-The bad news is what's *not* tested — `test_server.py` calls the tool
-functions directly rather than going through a real MCP transport, so
-nothing would catch it if the port quietly changed a response shape (2.0
-adds some new tool-decorator options that could do exactly that). Worth
-writing those tests before actually lifting the cap, not after.
+A compatibility symlink clears it, and `QUICKSTART.md` now carries that plus
+the `dnf` line that works on Fedora. The symlink is sound because both
+distros are on the same upstream release series — Ubuntu 24.04 has libpcap
+1.10.4, Fedora 43 has 1.10.6 — so the soname difference is Debian convention
+rather than an ABI break. That's the assumption to re-check if it ever stops
+working: if those versions drift apart, a symlink across a soname boundary
+stops being safe.
 
-## The Linux dependency list is "known to work," not "proven minimal"
+The cleaner fix, if this gets annoying, is to stop linking libpcap at all.
+It's only there for NE2000 ethernet emulation, which the host-control/MCP
+use case never touches.
 
-`QUICKSTART.md` tells Linux users to install seven packages
-(`libsdl2-2.0-0`, `libsdl2-net-2.0-0`, `libasound2t64`, `libncurses6`,
-`libpcap0.8`, `libslirp0`, `libfluidsynth3`), and that's genuinely enough —
-tested it on a fresh WSL2 Ubuntu 26.04 install and the emulator ran a real
-DOS command with just those seven.
+Fedora also needs `libXrandr` named explicitly — Ubuntu's SDL2 package
+depends on it, Fedora's doesn't — which is the general shape of the problem:
+the Debian package list doesn't translate one-for-one, because what arrives
+free as a dependency differs per distro.
 
-But the binary actually links a longer list than that
-(`libGL`, `libX11`, `libXrandr`, `libz`, `libpng16`, `libtinfo`, `libpulse`,
-`libsamplerate`, `libXext` all show up too) — they just happened to arrive
-for free as dependencies of the seven packages above. That held on Debian/
-Ubuntu. A distro that splits its packages differently could hit a gap this
-one test wouldn't have caught.
+The package list itself is no longer taking anyone's word for it.
+`scripts/check_runtime_deps.py` runs in the release build and fails it if
+the emulator links anything `QUICKSTART.md` doesn't account for, against a
+committed soname → package mapping. Writing it turned up two libraries the
+list had been missing all along (`libgl1`, `libpng16-16t64`); both are
+present on any desktop system, which is why nobody hit it.
 
 ## Two things left out on purpose, not by accident
 
